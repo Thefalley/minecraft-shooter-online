@@ -1,0 +1,21 @@
+{
+  "name": "@mvp/game",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Voxel-Dragons (EHxuban11) ported into the multiplayer-voxel-mvp monorepo. Renderer is vanilla Three.js + Vite; networking layer plugs into the Colyseus server in apps/server.",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "echo skipped (game is plain JS for now)"
+  },
+  "dependencies": {
+    "@mvp/shared": "workspace:*",
+    "colyseus.js": "0.16.13",
+    "three": "0.169.0"
+  },
+  "devDependencies": {
+    "vite": "5.4.10"
+  }
+}

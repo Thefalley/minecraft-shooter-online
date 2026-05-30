@@ -17,6 +17,7 @@
     "dev": "pnpm -r --parallel run dev",
     "dev:web": "pnpm --filter @mvp/web dev",
     "dev:server": "pnpm --filter @mvp/server dev",
+    "dev:game": "pnpm --filter @mvp/game dev",
     "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
     "test:online": "node tests/online.mjs",
