@@ -4,6 +4,18 @@ import { create } from "zustand";
 import type { ConnectionStatus } from "@mvp/shared";
 import { getTransport } from "@/networking/colyseusTransport";
 
+const DEFAULT_GAME_URL = "http://localhost:5173";
+
+function buildGameUrl(
+  roomCode: string,
+  name: string,
+  mode: "create" | "join"
+): string {
+  const base = process.env.NEXT_PUBLIC_GAME_URL ?? DEFAULT_GAME_URL;
+  const params = new URLSearchParams({ code: roomCode, name, mode });
+  return `${base.replace(/\/$/, "")}/?${params.toString()}`;
+}
+
 type LobbyState = {
   name: string;
   setName: (n: string) => void;
@@ -18,6 +30,7 @@ type LobbyState = {
   createRoom: (name: string) => Promise<void>;
   joinRoomByCode: (name: string, code: string) => Promise<void>;
   leaveRoom: () => Promise<void>;
+  redirectToGame: (mode: "create" | "join") => void;
 };
 
 export const useLobbyStore = create<LobbyState>((set, get) => ({
@@ -64,5 +77,12 @@ export const useLobbyStore = create<LobbyState>((set, get) => ({
     set({ roomCode: null, selfId: null, status: "idle", error: null });
     // Reset transient connection state but keep the chosen name.
     void get;
+  },
+  redirectToGame(mode) {
+    if (typeof window === "undefined") return;
+    const { roomCode, name } = get();
+    if (!roomCode) return; // defensive: nothing to hand off
+    const trimmed = name.trim();
+    window.location.href = buildGameUrl(roomCode, trimmed, mode);
   },
 }));
