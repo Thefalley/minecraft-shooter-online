@@ -3,6 +3,17 @@ import * as THREE from 'three';
 const DEFAULT_DRAGON_COUNT = 3;
 const FIREBALL_COLLISION_RADIUS = 1.15;
 
+// LOD distance thresholds (squared comparisons used in hot paths).
+const LOD0_MAX_DISTANCE = 25;
+const LOD1_MAX_DISTANCE = 60;
+const LOD0_MAX_DISTANCE_SQ = LOD0_MAX_DISTANCE * LOD0_MAX_DISTANCE;
+const LOD1_MAX_DISTANCE_SQ = LOD1_MAX_DISTANCE * LOD1_MAX_DISTANCE;
+const HEALTHBAR_MAX_DISTANCE_SQ = 40 * 40;
+
+// Module-scope scratch array reused across every raycast against dragons.
+// Cleared at the top of each peek/hit; never re-allocated per shot.
+const _INTERSECT_SCRATCH = [];
+
 function lerpAngle(from, to, alpha) {
   const delta = Math.atan2(Math.sin(to - from), Math.cos(to - from));
   return from + delta * THREE.MathUtils.clamp(alpha, 0, 1);
@@ -138,6 +149,25 @@ export class DragonManager {
         this.origin.z + Math.sin(angle) * dragon.orbitRadius,
       );
       dragon.mesh.userData.dragon = dragon;
+
+      // Cache per-LOD collision lists once at spawn so the raycast hot path
+      // does not walk traverse() over every dragon group every shot. Each
+      // LOD has its own list; updateDragon picks the active one based on
+      // currentLOD. L2 is a flat billboard quad — still hittable so the
+      // player can damage far dragons, just with a single mesh.
+      dragon._lodMeshes = [[], [], []];
+      const lodGroups = [dragon.userData.lod0, dragon.userData.lod1, dragon.userData.lod2];
+      for (let li = 0; li < lodGroups.length; li += 1) {
+        lodGroups[li].traverse((obj) => {
+          if (obj.isMesh && obj.userData.dragonRoot === dragon.mesh) {
+            dragon._lodMeshes[li].push(obj);
+          }
+        });
+      }
+      // Active list (swapped by updateDragon when LOD changes). Starts at L0
+      // because that's the visible LOD at spawn.
+      dragon._collisionMeshes = dragon._lodMeshes[0];
+
       this.group.add(dragon.mesh);
       this.group.add(dragon.healthBar);
       this.dragons.push(dragon);
@@ -160,7 +190,13 @@ export class DragonManager {
       }),
     );
     bg.renderOrder = 998;
-    bg.frustumCulled = false;
+    // The bar is camera-billboarded each frame to the dragon's head position,
+    // so its bounding sphere is recomputed in-place and frustum culling can
+    // safely reject it when offscreen. (Previous code forced frustumCulled to
+    // false to dodge a flicker bug; we now hide the bar entirely past
+    // HEALTHBAR_MAX_DISTANCE, which keeps it onscreen 99% of the time it's
+    // visible at all.)
+    bg.frustumCulled = true;
 
     const fillGeometry = new THREE.PlaneGeometry(1, height);
     fillGeometry.translate(0.5, 0, 0); // left-anchored unit quad
@@ -176,12 +212,14 @@ export class DragonManager {
     fill.scale.x = width;
     fill.position.z = 0.01;
     fill.renderOrder = 999;
-    fill.frustumCulled = false;
+    fill.frustumCulled = true;
 
     group.add(bg, fill);
     group.userData.fill = fill;
     group.userData.width = width;
-    group.frustumCulled = false;
+    // Group itself isn't culled by Three.js (only meshes are), so this flag
+    // is a no-op — set to true for clarity.
+    group.frustumCulled = true;
     return group;
   }
 
@@ -235,25 +273,32 @@ export class DragonManager {
     const dragon = new THREE.Group();
     dragon.name = `EnderDragon_${index}`;
 
+    // ----- LOD 0: full detailed mesh (active at distance < 25u). -----
+    // Built directly on the dragon root so existing getObjectByName('head'),
+    // getObjectByName('leftWing'/'rightWing') and traverse-based code paths
+    // (slow tint, etc.) keep working without changes.
+    const lod0 = new THREE.Group();
+    lod0.name = 'LOD0';
+
     // Torso + chest + belly.
     const torso = this._box(2.8, 1.5, 1.9);
     torso.position.set(-0.3, 0, 0);
     torso.receiveShadow = true;
-    dragon.add(torso);
+    lod0.add(torso);
     const chest = this._box(1.7, 1.7, 2.0);
     chest.position.set(1.2, 0.15, 0);
-    dragon.add(chest);
+    lod0.add(chest);
     const belly = this._box(2.6, 0.4, 1.5, this.material.belly, false);
     belly.position.set(0.2, -0.85, 0);
-    dragon.add(belly);
+    lod0.add(belly);
 
     // Neck.
     const neck1 = this._box(1.1, 1.0, 1.0);
     neck1.position.set(2.2, 0.65, 0);
-    dragon.add(neck1);
+    lod0.add(neck1);
     const neck2 = this._box(0.95, 0.9, 0.85);
     neck2.position.set(3.0, 1.15, 0);
-    dragon.add(neck2);
+    lod0.add(neck2);
 
     // Head group (pivots at the neck so it can track the player). Its parts
     // extend along +X (the dragon's forward axis).
@@ -278,13 +323,13 @@ export class DragonManager {
       horn.rotation.z = 0.3;
       head.add(horn);
     }
-    dragon.add(head);
+    lod0.add(head);
 
     // Spine spikes from neck to tail.
     for (const [sx, sh] of [[2.0, 0.55], [1.0, 0.55], [0.0, 0.5], [-1.0, 0.45]]) {
       const spike = this._box(0.3, sh, 0.3, this.material.spike, false);
       spike.position.set(sx, 1.05, 0);
-      dragon.add(spike);
+      lod0.add(spike);
     }
 
     // Tapering, drooping tail with fins.
@@ -295,10 +340,10 @@ export class DragonManager {
       const [w, h, d] = segs[i];
       const seg = this._box(w, h, d);
       seg.position.set(tx, ty, 0);
-      dragon.add(seg);
+      lod0.add(seg);
       const fin = this._box(0.16, 0.4, 0.16, this.material.spike, false);
       fin.position.set(tx, ty + h * 0.5 + 0.18, 0);
-      dragon.add(fin);
+      lod0.add(fin);
       tx -= (w * 0.5 + (segs[i + 1]?.[0] ?? 0.3) * 0.5) + 0.05;
       ty -= 0.13;
     }
@@ -307,16 +352,75 @@ export class DragonManager {
     for (const [lx, lz] of [[1.1, 0.85], [1.1, -0.85], [-0.8, 0.85], [-0.8, -0.85]]) {
       const leg = this._box(0.5, 0.95, 0.5);
       leg.position.set(lx, -0.95, lz);
-      dragon.add(leg);
+      lod0.add(leg);
     }
 
-    // Wings.
-    dragon.add(this.makeWing(1));
-    dragon.add(this.makeWing(-1));
+    // Wings live INSIDE lod0 so they hide automatically with the rest of the
+    // detail mesh at far LODs. updateDragon already skips wing-flap and head
+    // tracking when the active LOD isn't 0, so we don't waste those Matrix4
+    // updates for a hidden mesh tree. getObjectByName('leftWing'/'rightWing')
+    // still resolves through dragon.mesh because it walks descendants.
+    const leftWing = this.makeWing(1);
+    const rightWing = this.makeWing(-1);
+    lod0.add(leftWing);
+    lod0.add(rightWing);
 
+    dragon.add(lod0);
+
+    // ----- LOD 1: silhouette hull (active at 25 <= distance < 60). -----
+    // A tiny stand-in mesh: body box + two wing planes + head box. Picks up
+    // the same body/wing materials so it visually matches at a glance.
+    const lod1 = new THREE.Group();
+    lod1.name = 'LOD1';
+    const lod1Body = this._box(4, 1.5, 2, this.material.body, false);
+    lod1Body.position.set(0, 0, 0);
+    lod1.add(lod1Body);
+    const lod1Head = this._box(1.2, 1.0, 1.0, this.material.body, false);
+    lod1Head.position.set(2.6, 0.6, 0);
+    lod1.add(lod1Head);
+    const lod1WingL = this._box(3, 0.1, 1.6, this.material.wing, false);
+    lod1WingL.position.set(0, 0.6, 1.6);
+    lod1.add(lod1WingL);
+    const lod1WingR = this._box(3, 0.1, 1.6, this.material.wing, false);
+    lod1WingR.position.set(0, 0.6, -1.6);
+    lod1.add(lod1WingR);
+    lod1.visible = false;
+    dragon.add(lod1);
+
+    // ----- LOD 2: billboard quad (active at distance >= 60). -----
+    // Stub: a plain colored quad until a proper sprite atlas exists. It's
+    // not pretty, but at this range it just needs to scream "dragon here".
+    // The plane uses a per-dragon material instance (so each dragon can be a
+    // different tint) and DoubleSide so we don't have to billboard it.
+    const lod2 = new THREE.Group();
+    lod2.name = 'LOD2';
+    const billboardGeometry = new THREE.PlaneGeometry(2.4, 1.2);
+    const billboardMaterial = new THREE.MeshBasicMaterial({
+      color: 0x23232e,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const billboard = new THREE.Mesh(billboardGeometry, billboardMaterial);
+    billboard.position.set(0, 0.5, 0);
+    lod2.add(billboard);
+    lod2.visible = false;
+    dragon.add(lod2);
+
+    // Tag every mesh under the root with its parent dragon group so the
+    // raycaster can resolve which dragon was hit from any LOD.
     dragon.traverse((child) => {
       if (child.isMesh) child.userData.dragonRoot = dragon;
     });
+
+    // Expose LOD groups + per-LOD billboard refs for the update loop. Stored
+    // on the THREE.Group itself so spawnDragons can read them without an extra
+    // map.
+    dragon.userData.lod0 = lod0;
+    dragon.userData.lod1 = lod1;
+    dragon.userData.lod2 = lod2;
+    dragon.userData.lod2Material = billboardMaterial;
+    dragon.userData.currentLOD = 0;
 
     return dragon;
   }
@@ -379,40 +483,94 @@ export class DragonManager {
     }
     dragon.mesh.rotation.z = THREE.MathUtils.clamp(-dragon.velocity.y * 0.18, -0.35, 0.35);
 
-    const flap = Math.sin(this.elapsed * 12 + dragon.id) * 0.55;
-    const leftWing = dragon.mesh.getObjectByName('leftWing');
-    const rightWing = dragon.mesh.getObjectByName('rightWing');
-    if (leftWing && rightWing) {
-      leftWing.rotation.x = flap;
-      rightWing.rotation.x = -flap;
+    // LOD selection: based on planar distance to the player. Cheaper than
+    // distanceTo() (no sqrt) and good enough — the player rarely sees a
+    // dragon directly overhead.
+    const dy = playerPosition.y - dragon.mesh.position.y;
+    const distSq = dxp * dxp + dy * dy + dzp * dzp;
+    let nextLOD;
+    if (distSq < LOD0_MAX_DISTANCE_SQ) nextLOD = 0;
+    else if (distSq < LOD1_MAX_DISTANCE_SQ) nextLOD = 1;
+    else nextLOD = 2;
+
+    const ud = dragon.userData;
+    if (ud.currentLOD !== nextLOD) {
+      ud.lod0.visible = nextLOD === 0;
+      ud.lod1.visible = nextLOD === 1;
+      ud.lod2.visible = nextLOD === 2;
+      ud.currentLOD = nextLOD;
+      // Swap the active collision-mesh list so raycasts only test the LOD
+      // the player can see. Falls back to the L0 list if a list is empty.
+      const lodList = dragon._lodMeshes[nextLOD];
+      dragon._collisionMeshes = lodList && lodList.length > 0 ? lodList : dragon._lodMeshes[0];
     }
 
-    // The head tracks the player, but only within 30 degrees of the body so it
-    // looks natural.
-    dragon.mesh.updateMatrixWorld();
-    const head = dragon.mesh.getObjectByName('head');
-    if (head) {
-      head.getWorldPosition(this._headPos);
-      this.tmpDirection.subVectors(playerPosition, this._headPos);
-      if (this.tmpDirection.lengthSq() > 0.0001) {
-        this.tmpDirection.normalize();
+    // Wing flap and head tracking only matter for the detailed mesh — at L1
+    // there are no wing/head sub-groups by name, and at L2 it's a quad. Skip
+    // entirely when we're not on L0 to save the matrix work and getObjectByName
+    // lookups.
+    if (nextLOD === 0) {
+      const flap = Math.sin(this.elapsed * 12 + dragon.id) * 0.55;
+      const leftWing = dragon.mesh.getObjectByName('leftWing');
+      const rightWing = dragon.mesh.getObjectByName('rightWing');
+      if (leftWing && rightWing) {
+        leftWing.rotation.x = flap;
+        rightWing.rotation.x = -flap;
+      }
+
+      // The head tracks the player, but only within 30 degrees of the body so
+      // it looks natural.
+      dragon.mesh.updateMatrixWorld();
+      const head = dragon.mesh.getObjectByName('head');
+      if (head) {
+        head.getWorldPosition(this._headPos);
+        this.tmpDirection.subVectors(playerPosition, this._headPos);
+        if (this.tmpDirection.lengthSq() > 0.0001) {
+          this.tmpDirection.normalize();
+          dragon.mesh.getWorldQuaternion(this._headParentQuat);
+          this.tmpDirection.applyQuaternion(this._headParentQuat.invert()); // to dragon-local space
+          const limit = Math.PI / 6; // 30 degrees
+          const localYaw = Math.atan2(-this.tmpDirection.z, this.tmpDirection.x);
+          const localPitch = Math.asin(THREE.MathUtils.clamp(this.tmpDirection.y, -1, 1));
+          head.rotation.set(
+            0,
+            THREE.MathUtils.clamp(localYaw, -limit, limit),
+            THREE.MathUtils.clamp(localPitch, -limit, limit),
+          );
+        }
+      }
+    } else if (nextLOD === 2) {
+      // Billboard the L2 quad toward the camera. The quad lives inside the
+      // dragon root which yaws to face the player, so we have to undo the
+      // root's world rotation before applying the camera's: localQ =
+      // parentWorldQ.invert() * cameraWorldQ. updateMatrixWorld() is needed
+      // first because rotation.y was just changed.
+      if (this.camera) {
+        dragon.mesh.updateMatrixWorld();
+        this.camera.getWorldQuaternion(this.tmpQuaternion);
         dragon.mesh.getWorldQuaternion(this._headParentQuat);
-        this.tmpDirection.applyQuaternion(this._headParentQuat.invert()); // to dragon-local space
-        const limit = Math.PI / 6; // 30 degrees
-        const localYaw = Math.atan2(-this.tmpDirection.z, this.tmpDirection.x);
-        const localPitch = Math.asin(THREE.MathUtils.clamp(this.tmpDirection.y, -1, 1));
-        head.rotation.set(
-          0,
-          THREE.MathUtils.clamp(localYaw, -limit, limit),
-          THREE.MathUtils.clamp(localPitch, -limit, limit),
-        );
+        ud.lod2.quaternion.copy(this._headParentQuat.invert()).multiply(this.tmpQuaternion);
       }
     }
+
+    // Stash the squared distance for the health-bar update so we don't
+    // recompute.
+    dragon._distSqToPlayer = distSq;
   }
 
   updateHealthBar(dragon) {
     const bar = dragon.healthBar;
     if (!bar) return;
+
+    // Hide the entire bar when the dragon is far away. Saves a billboard
+    // matrix copy + two transparent draw calls per dragon. updateDragon
+    // already computed the squared distance to the player; reuse it.
+    const distSq = dragon._distSqToPlayer ?? 0;
+    if (distSq > HEALTHBAR_MAX_DISTANCE_SQ) {
+      if (bar.visible) bar.visible = false;
+      return;
+    }
+    if (!bar.visible) bar.visible = true;
 
     bar.position.copy(dragon.mesh.position);
     bar.position.y += 3.3;
@@ -551,16 +709,21 @@ export class DragonManager {
       raycaster.far = Infinity;
     }
 
-    const meshes = [];
-    for (const dragon of this.dragons) {
-      if (!dragon.dead) {
-        dragon.mesh.traverse((child) => {
-          if (child.isMesh) meshes.push(child);
-        });
+    // Build the intersect list from the per-dragon cached collision meshes
+    // (populated at spawn time). No traverse() per shot. Reuse a single
+    // module-scope scratch array so we don't allocate.
+    _INTERSECT_SCRATCH.length = 0;
+    for (let i = 0; i < this.dragons.length; i += 1) {
+      const dragon = this.dragons[i];
+      if (dragon.dead) continue;
+      const cached = dragon._collisionMeshes;
+      if (!cached) continue;
+      for (let j = 0; j < cached.length; j += 1) {
+        _INTERSECT_SCRATCH.push(cached[j]);
       }
     }
 
-    const hits = raycaster.intersectObjects(meshes, false);
+    const hits = raycaster.intersectObjects(_INTERSECT_SCRATCH, false);
     if (hits.length === 0) return null;
 
     const root = hits[0].object.userData.dragonRoot;
@@ -623,16 +786,19 @@ export class DragonManager {
       raycaster.far = Infinity;
     }
 
-    const meshes = [];
-    for (const dragon of this.dragons) {
-      if (!dragon.dead) {
-        dragon.mesh.traverse((child) => {
-          if (child.isMesh) meshes.push(child);
-        });
+    // Same cached-list strategy as peekRay — no traverse() at fire time.
+    _INTERSECT_SCRATCH.length = 0;
+    for (let i = 0; i < this.dragons.length; i += 1) {
+      const dragon = this.dragons[i];
+      if (dragon.dead) continue;
+      const cached = dragon._collisionMeshes;
+      if (!cached) continue;
+      for (let j = 0; j < cached.length; j += 1) {
+        _INTERSECT_SCRATCH.push(cached[j]);
       }
     }
 
-    const hits = raycaster.intersectObjects(meshes, false);
+    const hits = raycaster.intersectObjects(_INTERSECT_SCRATCH, false);
     const results = [];
     const seen = new Set();
 
