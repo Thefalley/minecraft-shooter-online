@@ -6,7 +6,7 @@ services:
     region: frankfurt
     rootDir: .
     buildCommand: |
-      corepack enable && corepack prepare pnpm@9.15.0 --activate
+      npm install -g pnpm@9.15.0
       pnpm install --ignore-scripts
       pnpm --filter @mvp/server build
     startCommand: pnpm --filter @mvp/server start
