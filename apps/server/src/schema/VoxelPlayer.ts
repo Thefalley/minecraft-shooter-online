@@ -42,6 +42,7 @@ export class VoxelPlayer extends Schema {
   // Status flags.
   @type("boolean") alive: boolean = true;
   @type("boolean") connected: boolean = true;
+  @type("boolean") isHost: boolean = false;
   @type("boolean") isGrounded: boolean = true;
   @type("boolean") isReloading: boolean = false;
   @type("boolean") guardActive: boolean = false;
