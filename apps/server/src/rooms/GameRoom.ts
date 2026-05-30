@@ -157,6 +157,28 @@ export class GameRoom extends Room<GameState> {
     this.state.tick++;
     const dt = TICK_INTERVAL_MS / 1000;
 
+    // Cheap exit when no client is pressing a movement key — skip the full
+    // simulation loop and just sync rotations that may have changed. Saves
+    // ~all per-player CPU on the Render Free instance when everyone is idle.
+    let anyMoving = false;
+    for (const input of this.latestInputs.values()) {
+      if (input.forward || input.backward || input.left || input.right) {
+        anyMoving = true;
+        break;
+      }
+    }
+    if (!anyMoving) {
+      this.state.players.forEach((player, sessionId) => {
+        if (!player.alive || !player.connected) return;
+        const input = this.latestInputs.get(sessionId);
+        if (!input) return;
+        if (player.rotationY !== input.rotationY) {
+          player.rotationY = input.rotationY;
+        }
+      });
+      return;
+    }
+
     this.state.players.forEach((player, sessionId) => {
       if (!player.alive || !player.connected) return;
       const input = this.latestInputs.get(sessionId);

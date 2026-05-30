@@ -132,19 +132,41 @@ export function useInput(): UseInputResult {
     };
     raf = requestAnimationFrame(loop);
 
-    // 20 Hz input pump to the server.
+    // 20 Hz input pump to the server, throttled: only send when something
+    // changed (keys flipped, yaw drifted) or every KEEPALIVE_MS as a heartbeat.
+    // Saves ~70% of WS messages when the player is idle without losing the
+    // server's awareness that we're still alive and looking somewhere.
+    let lastSent: PlayerInput | null = null;
+    let lastSentT = 0;
+    const KEEPALIVE_MS = 1000;
+    const YAW_EPS = 0.01;
     const interval = window.setInterval(() => {
       const k = keysRef.current;
+      const yaw = yawRef.current;
+      const now = performance.now();
+
+      const unchanged =
+        lastSent !== null &&
+        lastSent.forward === k.forward &&
+        lastSent.backward === k.backward &&
+        lastSent.left === k.left &&
+        lastSent.right === k.right &&
+        Math.abs(lastSent.rotationY - yaw) < YAW_EPS;
+
+      if (unchanged && now - lastSentT < KEEPALIVE_MS) return;
+
       const payload: PlayerInput = {
         forward: k.forward,
         backward: k.backward,
         left: k.left,
         right: k.right,
-        rotationY: yawRef.current,
+        rotationY: yaw,
         seq: ++seqRef.current,
       };
       try {
         getTransport().sendInput(payload);
+        lastSent = payload;
+        lastSentT = now;
       } catch {
         /* swallow — transport may be mid-disconnect */
       }
