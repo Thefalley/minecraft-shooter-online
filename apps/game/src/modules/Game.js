@@ -22,6 +22,7 @@ export class Game {
     this.root = root;
     this.character = options.character ?? CHARACTERS[0];
     this.onExit = options.onExit ?? null;
+    this.network = options?.network ?? null;
     this.clock = new THREE.Clock();
     this.scene = new THREE.Scene();
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -394,6 +395,10 @@ export class Game {
       }
     }
 
+    if (this.network && this.player && typeof this.player.buildInputCommand === 'function') {
+      const cmd = this.player.buildInputCommand(this.input, delta);
+      this.network.pushInput(cmd);
+    }
     this.player.update(delta, this.input, this.world);
     this.clampPlayerToBounds();
     this.world.update(delta);
@@ -456,6 +461,7 @@ export class Game {
     this.effects.applyCameraShake(this.camera);
     this.renderHud();
 
+    this.network?.tickFrame?.(performance.now());
     this.renderer.render(this.scene, this.activeCamera);
     this.input.update();
   }
