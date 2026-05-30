@@ -2,7 +2,16 @@
   "name": "multiplayer-voxel-mvp",
   "version": "0.1.0",
   "private": true,
-  "description": "Multiplayer-first voxel shooter web MVP",
+  "description": "Multiplayer-first voxel shooter web MVP: authoritative Colyseus server + Next.js + React Three Fiber + client-side prediction",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Thefalley/minecraft-shooter-online.git"
+  },
+  "homepage": "https://minecraft-shooter-online-web.vercel.app",
+  "bugs": {
+    "url": "https://github.com/Thefalley/minecraft-shooter-online/issues"
+  },
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "dev": "pnpm -r --parallel run dev",
@@ -10,6 +19,7 @@
     "dev:server": "pnpm --filter @mvp/server dev",
     "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
+    "test:online": "node tests/online.mjs",
     "clean": "pnpm -r exec rm -rf dist .next node_modules && rm -rf node_modules"
   },
   "engines": {

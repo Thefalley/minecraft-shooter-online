@@ -1,162 +1,227 @@
-# Multiplayer Voxel Shooter — MVP
+# Multiplayer Voxel Shooter
 
-Juego web 3D **multiplayer-first**. La propiedad clave es el online: el servidor es autoritativo, los clientes solo envían inputs, y dos jugadores pueden crear/unirse a una sala por código y verse en tiempo real.
+Juego web 3D **multiplayer-first**. La propiedad clave es el online: el servidor es autoritativo, el cliente predice localmente para que se sienta instantáneo, y dos jugadores cualesquiera pueden crear/unirse a una sala con un código y verse en tiempo real desde cualquier red.
 
-> Visualmente es deliberadamente simple (cápsulas en un plano con cuadrícula). El siguiente paso es añadir combate, después mundo voxel.
+**Jugar ya**: 👉 https://minecraft-shooter-online-web.vercel.app
+
+> El servidor gratuito de Render se duerme después de 15 minutos sin tráfico. Si nadie está jugando, la primera petición tarda ~30 s en despertarlo. Después va fluido.
+
+---
+
+## Stack
+
+| Capa | Librería | Versión | Dónde corre |
+|---|---|---|---|
+| Frontend | Next.js 14 + React 18 | 14.2 / 18.3 | Vercel |
+| 3D | React Three Fiber + drei + three | 8.17 / 9.114 / 0.169 | Cliente |
+| Estado cliente | Zustand | 5.0 | Cliente |
+| Networking client | colyseus.js | 0.16 | Cliente |
+| Servidor realtime | @colyseus/core + ws-transport | 0.16 | Render (Frankfurt) |
+| Schema sync | @colyseus/schema | 3.0 | Server ↔ Cliente |
+| HTTP server | express + cors | 4.21 / 2.8 | Render |
+| Runtime TS dev | tsx | 4.19 | Local |
+| Build bundle | esbuild | 0.24 | Render build |
+| Monorepo | pnpm workspaces | 9.15 | Local + CI |
+| Test E2E | playwright | 1.60 | Local |
 
 ## Estructura
 
 ```
-multiplayer-voxel-mvp/
+.
 ├── apps/
-│   ├── web/          # Next.js 14 + R3F (cliente)
-│   └── server/       # Colyseus 0.16 + Node (servidor autoritativo)
+│   ├── web/          # Next.js 14 + R3F (frontend → Vercel)
+│   └── server/       # Colyseus 0.16 (servidor autoritativo → Render)
 ├── packages/
-│   └── shared/       # Tipos, constantes y nombres de mensajes
+│   └── shared/       # Tipos, constantes, nombres de mensajes
 ├── tests/
-│   └── online.mjs    # Test Playwright con 2 navegadores
-└── screenshots/      # Capturas del test online (ignorado por git)
+│   ├── online.mjs        # Playwright: 2 navegadores, lobby+sync+disconnect
+│   └── public-smoke.mjs  # Probe contra URLs públicas arbitrarias
+├── render.yaml       # Blueprint del backend en Render
+├── package.json      # pnpm workspace root
+└── pnpm-workspace.yaml
 ```
 
-## Stack
+## Cómo jugar (producción)
 
-| Capa | Librería | Versión |
-|---|---|---|
-| Frontend | Next.js 14 + React 18 | 14.2 / 18.3 |
-| 3D | React Three Fiber + drei + three | 8.17 / 9.114 / 0.169 |
-| Estado cliente | Zustand | 5.0 |
-| Networking | colyseus.js | 0.16 |
-| Servidor | @colyseus/core + ws-transport | 0.16 |
-| Schema | @colyseus/schema | 3.0 |
-| HTTP server | express + cors | 4.21 / 2.8 |
-| Runtime TS dev | tsx | 4.19 |
-| Monorepo | pnpm workspaces | 9.15 |
-| Test E2E | playwright | 1.60 |
+1. Abre https://minecraft-shooter-online-web.vercel.app
+2. Escribe tu nombre y pulsa **Crear sala**. El HUD muestra un código (5 caracteres, p. ej. `K3PMT`).
+3. Pasa la URL + el código a quien quieras invitar.
+4. Esa persona abre la URL, escribe su nombre, pega el código, **Unirse**.
+5. WASD para mover, Q/E para girar, Esc para volver al lobby.
 
-## Requisitos
-
-- Node.js ≥ 20
-- pnpm ≥ 9
-
-## Quick start
-
-```bash
-pnpm install --ignore-scripts   # ignore-scripts evita postinstalls problemáticos en Windows
-pnpm dev:server                  # http://localhost:2567
-pnpm dev:web                     # http://localhost:3000
-```
-
-Abre dos pestañas en `http://localhost:3000`:
-1. En la primera, escribe tu nombre y pulsa **Crear sala**. El HUD enseña un código (5 caracteres).
-2. En la segunda, escribe otro nombre, pega el código y pulsa **Unirse**.
-3. Las dos cápsulas aparecen en la misma escena 3D. **WASD** mueve, **Q/E** rota.
+Ambos jugadores aparecen como cápsulas en una escena 3D simple, y se mueven en tiempo real. Arriba a la derecha hay un overlay con **FPS** y **PING** al servidor.
 
 ## Arquitectura: por qué el servidor es autoritativo
 
-- El cliente captura WASD + yaw y envía `{forward, backward, left, right, rotationY, seq}` a 20 Hz.
+- El cliente captura WASD + yaw y envía `{forward, backward, left, right, rotationY, seq}` al servidor.
 - El servidor mantiene `GameState { roomCode, tick, players: Map<id, Player> }`.
-- En cada tick (50 ms) el servidor lee el último input de cada jugador, aplica `PLAYER_SPEED · dt` rotado por el yaw, hace clamp de delta máximo (anti-cheat) y mete la posición dentro de `[-WORLD_HALF_SIZE, +WORLD_HALF_SIZE]`.
+- En cada tick (50 ms = 20 Hz) el servidor lee el último input de cada jugador, aplica `PLAYER_SPEED · dt` rotado por yaw, hace clamp de delta máximo (anti-cheat) y mete la posición dentro de `[-WORLD_HALF_SIZE, +WORLD_HALF_SIZE]`.
 - Colyseus difunde el patch del schema a todos los clientes.
-- El cliente renderiza las cápsulas remotas con interpolación simple (lerp).
 
-Esto significa que **el cliente no decide su posición final**. Si manda un input ilegal, lo ignora; si manda yaw raro lo limita.
+**El cliente NO decide su posición final** — el server tiene la última palabra. Si el cliente intenta teletransportarse, el server lo ignora.
+
+### Client-Side Prediction (CSP)
+
+El servidor autoritativo solo no basta para que se sienta bien: pulsar W y esperar 60-100 ms hasta ver el avatar moverse es muy raro. Por eso aplicamos la misma física en el cliente a 60 Hz:
+
+- `apps/web/src/game/selfPrediction.ts` reproduce la fórmula del server (movimiento world-space rotado por yaw, clamp a `WORLD_HALF_SIZE`).
+- `useInput.ts` llama a `applyLocalInput()` cada frame con los keys actuales.
+- `LocalPlayer.tsx` renderiza desde la predicción, no desde el snapshot.
+- Cuando llega un snapshot del server, `reconcileWithSnapshot()`:
+  - Si la divergencia es < 1.5 u → blend suave (15%) hacia el server, sin saltos visibles.
+  - Si es ≥ 1.5 u → snap directo al server (el cliente había predicho mal o intentó cosas raras).
+
+Esto es la técnica clásica de Quake/Source: el local se siente como single-player; el server sigue mandando.
+
+### Snapshot interpolation buffer (remotos)
+
+Para que los jugadores remotos no se vean a saltitos cada 50 ms, `RemotePlayer.tsx` mantiene un buffer de las últimas 24 snapshots con timestamp y renderiza con un delay de 120 ms, interpolando entre las dos snapshots que rodean al tiempo de render. Es lo que hace Source/CS:GO. La consecuencia: ves a tu rival con 120 ms de delay, invisible en gameplay casual; relevante si añadimos disparos a la cabeza (entonces toca lag compensation server-side).
 
 ### Capa de transport abstracta
 
-`apps/web/src/networking/transport.ts` define una interfaz `NetworkTransport`. La única implementación actual es `ColyseusTransport` (servidor dedicado). Para añadir host-jugador con WebRTC en el futuro, basta crear `WebRTCHostTransport` y `WebRTCClientTransport` que cumplan la misma interfaz, sin tocar el resto de la app.
+`apps/web/src/networking/transport.ts` define una interfaz `NetworkTransport`. La única implementación actual es `ColyseusTransport` (servidor dedicado). El día que queramos modo host-jugador con WebRTC, basta crear `WebRTCHostTransport` + `WebRTCClientTransport` que cumplan la misma interfaz, sin tocar el resto.
 
 ## Salas con código
 
 - Generación: 5 caracteres del alfabeto `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (sin 0/1/I/O).
-- El servidor expone `GET /rooms/by-code/:code` que devuelve `{ roomId, roomCode, clients, maxClients }`. El cliente lo consulta antes del `joinById`, así puede mostrar errores claros: `ROOM_NOT_FOUND`, `INVALID_CODE`, `ROOM_FULL`.
+- El servidor expone `GET /rooms/by-code/:code` que devuelve `{ roomId, roomCode, clients, maxClients }` (404 / 400 si no existe / mal formado).
+- El cliente lo consulta antes del `joinById`, así puede mostrar errores claros: `ROOM_NOT_FOUND`, `INVALID_CODE`, `ROOM_FULL`.
 - `MAX_PLAYERS_PER_ROOM = 8` (configurable en `packages/shared/src/constants.ts`).
-- Ventana de reconexión: 10 s. Si la pestaña se cierra, el jugador queda marcado como `connected=false` durante 10 s antes de borrarlo del estado.
+- Ventana de reconexión: 10 s. Si la pestaña se cierra accidentalmente, el jugador queda `connected=false` durante 10 s antes de borrarlo del estado.
 
-## Validación: test online con dos navegadores
-
-```bash
-# en una terminal
-pnpm dev:server
-# en otra
-pnpm dev:web
-# en una tercera
-node tests/online.mjs
-```
-
-El test (`tests/online.mjs`):
-1. Lanza Chromium con 2 contextos aislados (= 2 dispositivos).
-2. Alice crea sala, extrae el código del HUD.
-3. Bob se une con el código.
-4. Comprueba que ambos clientes ven `Alice` y `Bob` en su lista.
-5. Alice pulsa W y D — confirma que la pantalla cambia.
-6. Bob ve a Alice moverse desde su perspectiva.
-7. Bob cierra la pestaña, Alice queda sola tras la ventana de reconexión.
-8. Guarda 10 screenshots en `screenshots/`.
-
-## Endpoints HTTP del servidor
+## Endpoints HTTP
 
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | `{ status: "ok", uptime: ... }` |
-| GET | `/rooms/by-code/:code` | `{ roomId, roomCode, clients, maxClients }` o 404 / 400 |
+| GET | `/rooms/by-code/:code` | `{ roomId, roomCode, clients, maxClients }` |
 
-## Variables de entorno
+URL producción: `https://minecraft-shooter-online.onrender.com`
 
-`apps/web/.env.example`:
+## Desarrollo local
+
+### Requisitos
+
+- Node.js ≥ 20
+- pnpm ≥ 9
+
+### Arranque
+
+```bash
+pnpm install --ignore-scripts
+pnpm dev:server   # http://localhost:2567 — backend
+pnpm dev:web      # http://localhost:3000 — frontend
+```
+
+Abre dos pestañas en `http://localhost:3000` y juega contra ti mismo.
+
+Si en tu Windows los `.cmd` shims de pnpm no encuentran `node` en PATH (ver memoria de [project-runtime](memory/project_runtime.md)), llama a los binarios con la ruta completa:
+
+```bash
+"$(which node)" apps/server/node_modules/tsx/dist/cli.mjs apps/server/src/index.ts
+"$(which node)" apps/web/node_modules/next/dist/bin/next dev -H 0.0.0.0 -p 3000
+```
+
+### Variables de entorno
+
+`apps/web/.env.local`:
 ```
 NEXT_PUBLIC_SERVER_URL=ws://localhost:2567
 ```
 
-`apps/server/.env.example`:
+`apps/server/.env`:
 ```
 PORT=2567
 CORS_ORIGIN=http://localhost:3000
 NODE_ENV=development
 ```
 
+## Tests
+
+### E2E con dos navegadores reales
+
+```bash
+node tests/online.mjs                                          # contra localhost
+WEB_URL=https://tu-deploy.vercel.app node tests/online.mjs     # contra producción
+```
+
+Playwright headless Chromium arranca dos contextos aislados, Alice crea sala, Bob entra con el código, ambos se mueven, se ven, Bob cierra → Alice queda sola. Genera 10 capturas en `screenshots/`.
+
+### Smoke test rápido contra URLs públicas
+
+```bash
+node tests/public-smoke.mjs https://web.example.com https://api.example.com
+```
+
 ## Deploy
 
-- **Frontend** (Vercel): `vercel` desde `apps/web`. Define `NEXT_PUBLIC_SERVER_URL=wss://tu-servidor`.
-- **Servidor realtime** (Railway / Fly.io / Render):
-  - Comando build: `pnpm install --ignore-scripts && pnpm --filter @mvp/server build`.
-  - Comando start: `node apps/server/dist/index.js`.
-  - Variable `PORT` la inyecta la plataforma. Define `CORS_ORIGIN=https://tu-vercel-domain`.
+Producción actual:
+- **Frontend**: Vercel → https://minecraft-shooter-online-web.vercel.app
+- **Backend**: Render Free (Frankfurt) → https://minecraft-shooter-online.onrender.com
 
-## Decisión técnica importante
+### Frontend en Vercel
 
-### Servidor dedicado vs. host-jugador (WebRTC)
+1. Importar el repo en Vercel.
+2. **Root Directory**: `apps/web`.
+3. **Framework**: Next.js (auto-detectado).
+4. **Install Command**: `pnpm install --ignore-scripts`.
+5. **Environment Variable**: `NEXT_PUBLIC_SERVER_URL=wss://minecraft-shooter-online.onrender.com`.
+6. Deploy.
+
+### Backend en Render
+
+1. New → Web Service → conectar el repo.
+2. **Region**: Frankfurt (EU Central) — o el más cercano a tus jugadores.
+3. **Build Command**: `npm install -g pnpm@9.15.0 && pnpm install --ignore-scripts --no-prod && pnpm --filter @mvp/server build`.
+4. **Start Command**: `pnpm --filter @mvp/server start`.
+5. **Instance Type**: Free (sleep tras 15 min) o Starter ($7/mes, sin sleep).
+6. **Health Check Path**: `/health`.
+7. **Env vars**: `NODE_ENV=production`, `CORS_ORIGIN=https://tu-vercel-domain`.
+
+El bundle final es un único `apps/server/dist/index.mjs` de ~1.9 MB generado por esbuild, que Render arranca con `node`.
+
+## Decisión técnica: servidor dedicado vs host-jugador (WebRTC)
 
 | Criterio | Servidor dedicado (elegido) | Host-jugador |
 |---|---|---|
-| Implementación | Sencilla, Colyseus listo | Complejo: señalización + STUN/TURN |
-| Si el host se va | Sin efecto | Partida se cae o necesita migración |
-| Trampas | Difícil (servidor decide) | Fácil (host controla todo) |
-| Coste hosting | Sí (pequeño VPS) | Mínimo |
-| NAT | No es problema | Riesgo serio sin TURN |
+| Implementación | Sencilla, Colyseus listo | Compleja: señalización + STUN/TURN |
+| Si el host se va | Sin efecto | Partida cae o necesita migración |
+| Trampas | Difícil (server decide) | Fácil (host controla todo) |
+| Coste hosting | Sí (pequeño VPS o free tier) | Mínimo |
+| NAT / firewalls | Sin problema | Riesgo serio sin TURN |
 
-**Decisión**: arrancar con servidor dedicado autoritativo (Colyseus). Diseñar la capa de transport del cliente como interfaz para que, cuando merezca la pena, se pueda añadir un `WebRTCHostTransport` sin reescribir nada del juego.
+Decisión: MVP con servidor dedicado autoritativo en Colyseus. La capa `NetworkTransport` está preparada para añadir host-jugador cuando interese.
 
-## Limitaciones del MVP (deuda conocida)
+## Estado actual / limitaciones
 
-- Sin combate (sin armas, sin daño, sin muerte). Próximo hito: click izquierdo → intención de disparo → servidor valida → daño autoritativo.
-- Sin mundo voxel. Las cápsulas se mueven sobre un suelo plano con grid.
-- Sin colisiones entre jugadores (pasan entre sí).
-- Sin chat ni voz.
-- Sin persistencia: cerrar el servidor borra todas las salas.
-- Sin matchmaking público (siempre por código).
-- La interpolación de remotos es un lerp simple. Para movimientos rápidos en el futuro habrá que buffer de snapshots con delay tipo Quake/Source.
-- `pnpm install --ignore-scripts` evita un fallo de postinstall de `esbuild`/`msgpackr-extract` en este entorno Windows; en Linux/Mac no debería ser necesario.
+- ✅ Crear sala con código corto
+- ✅ Unirse por código
+- ✅ Movimiento WASD multijugador autoritativo
+- ✅ Client-Side Prediction (sensación instantánea local)
+- ✅ Snapshot interpolation buffer (remotos smooth)
+- ✅ Overlay FPS / ping en tiempo real
+- ✅ Desconexión limpia con ventana de reconexión 10 s
+- ✅ Lobby + validación de nombre + códigos sin caracteres ambiguos
+- ❌ Sin combate (próximo hito: disparos autoritativos, vida, respawn)
+- ❌ Sin mundo voxel (después del combate)
+- ❌ Sin colisiones entre jugadores
+- ❌ Sin chat, voz, persistencia, matchmaking público
+- ❌ Sin lag compensation server-side (necesario para disparos a la cabeza)
 
-## Siguiente hito
+## Próximo hito recomendado
 
-Combate básico autoritativo:
+**Combate básico autoritativo**:
 - Click izquierdo → cliente envía intención de disparo.
-- Servidor calcula raycast, decide impacto, aplica daño.
-- Vida sincronizada en el schema.
-- Muerte + respawn.
+- Servidor hace raycast contra cápsulas, aplica daño.
+- Vida sincronizada en el schema (`Player.health` ya existe).
+- Muerte → cápsula gris → respawn tras 3 s.
 
-Mantener la regla: el cliente nunca decide quién muere ni cuándo.
+Mantener la regla: el cliente nunca decide quién muere ni cuándo. La predicción cliente del MUSO ya está; lo que falta es lag compensation server-side (replay del estado N ms atrás) para que apuntar se sienta justo.
 
----
+## Histórico
 
-Generado con agentes paralelos en git worktrees: `feat/shared`, `feat/server`, `feat/web` mergeados en `main`.
+Construido con agentes paralelos en git worktrees: `feat/shared`, `feat/server`, `feat/web` mergeados en `main`. Ver `git log --oneline` para el historial detallado.
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).
