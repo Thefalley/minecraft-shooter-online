@@ -23,6 +23,8 @@ import { InputPump } from "./InputPump.js";
 import {
   VoxelClientMessage,
   VoxelServerMessage,
+  LobbyClientMessage,
+  LobbyServerMessage,
   ClientMessage,
   ServerMessage,
 } from "@mvp/shared";
@@ -196,10 +198,26 @@ export class NetworkBridge {
   }
 
   emitCharacterSelect(characterId) {
+    // Phase 2 introduced the lobby-namespaced variant. Send to BOTH so the
+    // server accepts whichever it has wired (lobby-flow agent kept both
+    // handlers active for backward-compat).
+    const L = LobbyClientMessage || {};
+    const lobbyKey = mkey(L, "CharacterSelect", "vp:lobby:characterSelect");
+    this._sendIfConnected(lobbyKey, { characterId });
     this._sendIfConnected(
       mkey(VoxelClientMessage, "CharacterSelect", "client:character:select"),
       { characterId },
     );
+  }
+
+  emitLobbyStart({ countdownMs = 3000 } = {}) {
+    const L = LobbyClientMessage || {};
+    this._sendIfConnected(mkey(L, "Start", "vp:lobby:start"), { countdownMs });
+  }
+
+  emitLobbyHostKick(sessionId) {
+    const L = LobbyClientMessage || {};
+    this._sendIfConnected(mkey(L, "HostKick", "vp:lobby:hostKick"), { sessionId });
   }
 
   emitSlotSelect(slotIndex) {
@@ -350,6 +368,12 @@ export class NetworkBridge {
     onMsg(mkey(V, "ShopApplied", "server:shop:applied"), "shopApplied");
     onMsg(mkey(V, "CoinsChange", "server:coins"), "coinsChange");
     onMsg(mkey(V, "Pong", "server:pong"), "pong");
+
+    // ── LobbyServerMessage (Phase 2 — waiting room lifecycle) ───────────
+    const L = LobbyServerMessage || {};
+    onMsg(mkey(L, "PhaseChange", "vs:lobby:phaseChange"), "lobbyPhaseChange");
+    onMsg(mkey(L, "HostChange", "vs:lobby:hostChange"), "lobbyHostChange");
+    onMsg(mkey(L, "StartCountdown", "vs:lobby:startCountdown"), "lobbyStartCountdown");
 
     // ── Room lifecycle ──────────────────────────────────────────────────
     const offLeave = room.onLeave?.((code) => {

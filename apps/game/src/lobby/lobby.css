@@ -333,3 +333,32 @@
     opacity: 1;
   }
 }
+
+/* ── Stats overlay (top-right FPS / PING — mirrors apps/web/StatsOverlay) ── */
+.vd-stats-overlay {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  background: rgba(10, 12, 16, 0.72);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.3;
+  color: #e8eaf0;
+  pointer-events: none;
+  min-width: 110px;
+}
+.vd-stats-overlay .row { display: flex; justify-content: space-between; gap: 12px; }
+.vd-stats-overlay .lbl { color: #8a93a3; letter-spacing: 0.5px; }
+.vd-stats-overlay .val { font-weight: 600; }
+.vd-stats-overlay .p-good { color: #6ee7a3; }
+.vd-stats-overlay .p-ok   { color: #f5d24a; }
+.vd-stats-overlay .p-bad  { color: #ef6360; }
+.vd-stats-overlay .p-idle { color: #8a93a3; }
