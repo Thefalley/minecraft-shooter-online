@@ -1,12 +1,19 @@
 "use client";
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Mesh } from "three";
 import type { PlayerSnapshot } from "@mvp/shared";
+import {
+  getPrediction,
+  reconcileWithSnapshot,
+} from "@/game/selfPrediction";
 
-const LERP = 0.25;
-
+/**
+ * Local player: rendered from the predicted position so WASD feels instant.
+ * Every new server snapshot triggers a reconcile that blends or snaps the
+ * prediction back to the authoritative truth.
+ */
 export function LocalPlayer({
   player,
 }: {
@@ -14,13 +21,23 @@ export function LocalPlayer({
 }): JSX.Element {
   const meshRef = useRef<Mesh>(null);
 
+  // Reconcile when the snapshot changes (server tick). Comparing primitives
+  // by value avoids running on every render of the parent.
+  useEffect(() => {
+    reconcileWithSnapshot({
+      x: player.x,
+      y: player.y,
+      z: player.z,
+      rotationY: player.rotationY,
+    });
+  }, [player.x, player.y, player.z, player.rotationY]);
+
   useFrame(() => {
     const m = meshRef.current;
     if (!m) return;
-    m.position.x += (player.x - m.position.x) * LERP;
-    m.position.y += (player.y - m.position.y) * LERP;
-    m.position.z += (player.z - m.position.z) * LERP;
-    m.rotation.y += (player.rotationY - m.rotation.y) * LERP;
+    const p = getPrediction();
+    m.position.set(p.x, p.y, p.z);
+    m.rotation.y = p.rotationY;
   });
 
   return (

@@ -5,12 +5,23 @@ import { useRouter } from "next/navigation";
 import { Canvas } from "@react-three/fiber";
 import { HUD } from "@/components/HUD";
 import { ConnectionBadge } from "@/components/ConnectionBadge";
+import { StatsOverlay } from "@/components/StatsOverlay";
 import { useInput } from "@/hooks/useInput";
 import { useTransportSubscription } from "@/hooks/useTransportSubscription";
 import { useLobbyStore } from "@/stores/lobbyStore";
+import { resetPrediction } from "./selfPrediction";
+import { tickFrame } from "./clientStats";
 import { Ground } from "./Ground";
 import { Players } from "./Players";
 import { CameraRig } from "./CameraRig";
+import { useFrame } from "@react-three/fiber";
+
+function FrameTicker(): null {
+  useFrame(() => {
+    tickFrame(performance.now());
+  });
+  return null;
+}
 
 export function GameScene(): JSX.Element {
   useTransportSubscription();
@@ -29,6 +40,12 @@ export function GameScene(): JSX.Element {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [leaveRoom, router]);
+
+  // Clear any prediction left over from a previous session.
+  useEffect(() => {
+    resetPrediction();
+    return () => resetPrediction();
+  }, []);
 
   return (
     <div className="game">
@@ -50,9 +67,11 @@ export function GameScene(): JSX.Element {
         <Ground />
         <Players />
         <CameraRig yawRef={yawRef} />
+        <FrameTicker />
       </Canvas>
       <HUD />
       <ConnectionBadge />
+      <StatsOverlay />
       <div className="crosshair" />
     </div>
   );

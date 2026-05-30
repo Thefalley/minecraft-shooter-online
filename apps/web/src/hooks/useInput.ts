@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { TICK_INTERVAL_MS, type PlayerInput } from "@mvp/shared";
 import { getTransport } from "@/networking/colyseusTransport";
+import { applyLocalInput } from "@/game/selfPrediction";
 
 const YAW_RATE = 2.4; // radians per second when holding Q or E
 
@@ -114,6 +115,19 @@ export function useInput(): UseInputResult {
       const k = keysRef.current;
       if (k.yawLeft) yawRef.current -= YAW_RATE * dt;
       if (k.yawRight) yawRef.current += YAW_RATE * dt;
+      // Client-side prediction: apply the same movement math the server uses
+      // so the local capsule responds at 60 Hz, then reconcile in LocalPlayer
+      // when the authoritative snapshot arrives.
+      applyLocalInput(
+        {
+          forward: k.forward,
+          backward: k.backward,
+          left: k.left,
+          right: k.right,
+          rotationY: yawRef.current,
+        },
+        dt,
+      );
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
