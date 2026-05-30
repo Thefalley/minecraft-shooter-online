@@ -4,16 +4,22 @@ import { create } from "zustand";
 import type { ConnectionStatus } from "@mvp/shared";
 import { getTransport } from "@/networking/colyseusTransport";
 
-const DEFAULT_GAME_URL = "http://localhost:5173";
-
 function buildGameUrl(
   roomCode: string,
   name: string,
   mode: "create" | "join"
 ): string {
-  const base = process.env.NEXT_PUBLIC_GAME_URL ?? DEFAULT_GAME_URL;
+  // Production fallback: if NEXT_PUBLIC_GAME_URL isn't configured (we haven't
+  // deployed apps/game to its own Vercel yet), hand off to the legacy /play
+  // route on the SAME origin. That's the R3F cubes-on-plane MVP that has
+  // worked since v0.1.0 and is built into apps/web. The Voxel-Dragons app
+  // takes over only once GAME_URL is set on the deploy.
+  const explicit = process.env.NEXT_PUBLIC_GAME_URL;
   const params = new URLSearchParams({ code: roomCode, name, mode });
-  return `${base.replace(/\/$/, "")}/?${params.toString()}`;
+  if (explicit) {
+    return `${explicit.replace(/\/$/, "")}/?${params.toString()}`;
+  }
+  return `/play?${params.toString()}`;
 }
 
 type LobbyState = {
