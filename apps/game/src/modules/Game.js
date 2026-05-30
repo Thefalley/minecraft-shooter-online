@@ -25,7 +25,10 @@ export class Game {
     this.clock = new THREE.Clock();
     this.scene = new THREE.Scene();
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // Cap at 1.5 on high-DPI displays: ~30% fewer pixels to shade with barely
+    // any perceived quality loss for low-poly voxel art. Major fill-rate win
+    // for integrated GPUs and laptops.
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.shadowMap.enabled = true;
     this.root.appendChild(this.renderer.domElement);
@@ -39,6 +42,9 @@ export class Game {
     this.effects = new Effects(this.scene);
     this.effects.camera = this.camera; // for camera-facing slash marks
     this.inventory = new Inventory(this.character);
+    // Pre-allocated input action names for hotbar slots to avoid template
+    // literal allocs in the per-frame loop.
+    this._weaponKeys = ["weapon1","weapon2","weapon3","weapon4","weapon5","weapon6","weapon7","weapon8"];
     this.world = new World(BALANCE.world);
     this.player = new Player(this.camera, {
       ...BALANCE.player,
@@ -358,9 +364,13 @@ export class Game {
       this.inventory.previous();
       this.onSelectionChanged();
     }
-    for (let i = 1; i <= this.inventory.slots.length; i += 1) {
-      if (this.input.consume(`weapon${i}`)) {
-        this.inventory.select(i - 1);
+    // Pre-built once in the constructor to skip the per-tick template-literal
+    // alloc (~480 strings/sec/player at 8 slots × 60 Hz before this change).
+    const weaponKeys = this._weaponKeys;
+    const slotCount = Math.min(this.inventory.slots.length, weaponKeys.length);
+    for (let i = 0; i < slotCount; i += 1) {
+      if (this.input.consume(weaponKeys[i])) {
+        this.inventory.select(i);
         this.onSelectionChanged();
       }
     }
