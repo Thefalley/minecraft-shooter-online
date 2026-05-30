@@ -1,0 +1,18 @@
+{
+  "name": "multiplayer-voxel-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multiplayer-first voxel shooter web MVP",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel run dev",
+    "dev:web": "pnpm --filter @mvp/web dev",
+    "dev:server": "pnpm --filter @mvp/server dev",
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "clean": "pnpm -r exec rm -rf dist .next node_modules && rm -rf node_modules"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
