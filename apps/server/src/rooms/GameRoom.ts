@@ -3,6 +3,8 @@ import {
   BLOCK_INTERACTION_RANGE,
   DEFAULT_WAVE_COUNT,
   GAME_ROOM_NAME,
+  LobbyClientMessage,
+  LobbyServerMessage,
   MAX_PLAYERS_PER_ROOM,
   PLAYER_DEFAULT_HEALTH,
   PLAYER_MAX_DELTA,
@@ -91,6 +93,28 @@ interface IncomingWeaponFire {
   seq?: unknown;
 }
 
+interface IncomingLobbyStart {
+  countdownMs?: unknown;
+}
+
+interface IncomingLobbyHostKick {
+  sessionId?: unknown;
+}
+
+/** Character ids accepted by the lobby's CharacterSelect handler. */
+const ALLOWED_CHARACTERS: ReadonlySet<string> = new Set([
+  "duck",
+  "knight",
+  "hunter",
+  "samurai",
+  "mage",
+]);
+
+/** Default countdown when host does not provide one. */
+const DEFAULT_START_COUNTDOWN_MS = 3000;
+/** Hard ceiling on host-supplied countdowns. */
+const MAX_START_COUNTDOWN_MS = 10000;
+
 // We forward the legacy lobby/landing handshake using the existing
 // `ServerMessage` enum from `@mvp/shared`. The voxel-specific stream of
 // messages uses {@link VoxelServerMessage}.
@@ -104,6 +128,13 @@ export class GameRoom extends Room<GameState> {
 
   /** Deterministic RNG. Re-seeded in `onCreate`. */
   private rand: () => number = mulberry32(0);
+
+  /**
+   * Absolute Date.now() at which the room should transition lobby → playing.
+   * `0` means no countdown is in flight. Set by {@link handleLobbyStart} and
+   * cleared on transition or on host disconnect.
+   */
+  private _pendingStartAt = 0;
 
   maxClients = MAX_PLAYERS_PER_ROOM;
 
@@ -168,7 +199,21 @@ export class GameRoom extends Room<GameState> {
     player.maxHealth = PLAYER_DEFAULT_HEALTH;
     player.alive = true;
     player.connected = true;
+
+    // Promote the first connected player to host. We check existing players
+    // (before the new one is inserted) so a missing host triggers promotion.
+    const hasHost = this.hasHost();
+    if (!hasHost) {
+      player.isHost = true;
+    }
+
     this.state.players.set(client.sessionId, player);
+
+    if (!hasHost) {
+      this.broadcast(LobbyServerMessage.HostChange, {
+        hostSessionId: client.sessionId,
+      });
+    }
 
     // Legacy welcome handshake, kept so the existing landing flow stays alive.
     client.send(ServerMessage.Welcome, {
@@ -263,6 +308,17 @@ export class GameRoom extends Room<GameState> {
     );
     this.onMessage(VoxelClientMessage.Ping, (client, raw) =>
       this.handlePing(client, raw as IncomingPing),
+    );
+
+    // Phase 2 — lobby handlers (host, character select, start countdown, kick).
+    this.onMessage(LobbyClientMessage.CharacterSelect, (client, raw) =>
+      this.handleCharacterSelect(client, raw as IncomingCharacterSelect),
+    );
+    this.onMessage(LobbyClientMessage.Start, (client, raw) =>
+      this.handleLobbyStart(client, raw as IncomingLobbyStart),
+    );
+    this.onMessage(LobbyClientMessage.HostKick, (client, raw) =>
+      this.handleHostKick(client, raw as IncomingLobbyHostKick),
     );
   }
 
@@ -388,12 +444,104 @@ export class GameRoom extends Room<GameState> {
     raw: IncomingCharacterSelect,
   ): void {
     if (!raw || typeof raw !== "object") return;
-    if (this.state.phase !== "lobby") return;
-    const id = typeof raw.characterId === "string" ? raw.characterId : "";
-    if (!id) return;
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
+
+    if (this.state.phase !== "lobby") {
+      client.send(ServerMessage.Error, {
+        code: "PHASE_LOCKED",
+        message: "Solo puedes cambiar de personaje en la sala de espera.",
+      });
+      return;
+    }
+
+    const id = typeof raw.characterId === "string" ? raw.characterId : "";
+    if (!ALLOWED_CHARACTERS.has(id)) {
+      client.send(ServerMessage.Error, {
+        code: "INVALID_CHARACTER",
+        message: `Personaje no válido: ${id}`,
+      });
+      return;
+    }
+
     player.characterId = id;
+  }
+
+  private handleLobbyStart(
+    client: Client,
+    raw: IncomingLobbyStart,
+  ): void {
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
+
+    if (!player.isHost) {
+      client.send(ServerMessage.Error, {
+        code: "NOT_HOST",
+        message: "Solo el anfitrión puede iniciar la partida.",
+      });
+      return;
+    }
+
+    if (this.state.phase !== "lobby") {
+      client.send(ServerMessage.Error, {
+        code: "PHASE_LOCKED",
+        message: "La partida ya ha comenzado.",
+      });
+      return;
+    }
+
+    let countdownMs = DEFAULT_START_COUNTDOWN_MS;
+    if (raw && typeof raw === "object" && typeof raw.countdownMs === "number" &&
+      Number.isFinite(raw.countdownMs)
+    ) {
+      countdownMs = Math.max(
+        0,
+        Math.min(MAX_START_COUNTDOWN_MS, Math.trunc(raw.countdownMs)),
+      );
+    }
+
+    const startsAt = Date.now() + countdownMs;
+    this._pendingStartAt = startsAt;
+    this.broadcast(LobbyServerMessage.StartCountdown, { startsAt });
+  }
+
+  private handleHostKick(
+    client: Client,
+    raw: IncomingLobbyHostKick,
+  ): void {
+    const requester = this.state.players.get(client.sessionId);
+    if (!requester) return;
+
+    if (!requester.isHost) {
+      client.send(ServerMessage.Error, {
+        code: "NOT_HOST",
+        message: "Solo el anfitrión puede expulsar jugadores.",
+      });
+      return;
+    }
+
+    if (this.state.phase !== "lobby") {
+      client.send(ServerMessage.Error, {
+        code: "PHASE_LOCKED",
+        message: "Solo puedes expulsar antes de iniciar la partida.",
+      });
+      return;
+    }
+
+    const targetSessionId =
+      raw && typeof raw === "object" && typeof raw.sessionId === "string"
+        ? raw.sessionId
+        : "";
+    if (!targetSessionId || targetSessionId === client.sessionId) return;
+
+    const target = this.clients.find((c) => c.sessionId === targetSessionId);
+    if (!target) return;
+
+    target.send(ServerMessage.Error, {
+      code: "KICKED",
+      message: "Has sido expulsado de la sala.",
+    });
+    target.leave(1000);
   }
 
   private handleReadyNextWave(client: Client): void {
@@ -436,6 +584,17 @@ export class GameRoom extends Room<GameState> {
   private update(): void {
     this.state.tick = (this.state.tick + 1) >>> 0;
     const dt = TICK_INTERVAL_MS / 1000;
+
+    // Lobby countdown — fires regardless of phase so we still observe the
+    // gate when a stale countdown lingers, but only actually transitions if
+    // we're still in the lobby phase.
+    if (
+      this._pendingStartAt !== 0 &&
+      Date.now() >= this._pendingStartAt &&
+      this.state.phase === "lobby"
+    ) {
+      this.transitionPhase("lobby", "playing");
+    }
 
     // Auto-close the shop when the timer expires (advance even if no player
     // sent ReadyNextWave).
@@ -651,12 +810,80 @@ export class GameRoom extends Room<GameState> {
   private removePlayer(sessionId: string): void {
     const player = this.state.players.get(sessionId);
     if (!player) return;
+    const wasHost = player.isHost;
     this.state.players.delete(sessionId);
     this.latestInputs.delete(sessionId);
     this.broadcast(ServerMessage.PlayerLeft, { id: sessionId, name: player.name });
+
+    if (wasHost) {
+      this.reassignHost();
+      // A pending countdown belongs to the (now gone) host — cancel it so the
+      // new host explicitly starts the next attempt.
+      if (this._pendingStartAt !== 0 && this.state.phase === "lobby") {
+        this._pendingStartAt = 0;
+        this.broadcast(LobbyServerMessage.StartCountdown, { startsAt: 0 });
+      }
+    }
+
     console.log(
       `[GameRoom ${this.state.roomCode}] -leave ${player.name} total=${this.state.players.size}`,
     );
+  }
+
+  /**
+   * Pick the next connected player as host and broadcast {@link
+   * LobbyServerMessage.HostChange}. Walks players in MapSchema iteration
+   * order, which on Colyseus is the insertion order — so the longest-staying
+   * connected player wins.
+   */
+  private reassignHost(): void {
+    let nextHostId: string | null = null;
+    this.state.players.forEach((p, id) => {
+      if (nextHostId !== null) return;
+      if (p.connected) nextHostId = id;
+    });
+    if (nextHostId === null) return;
+    const next = this.state.players.get(nextHostId);
+    if (!next) return;
+    next.isHost = true;
+    this.broadcast(LobbyServerMessage.HostChange, {
+      hostSessionId: nextHostId,
+    });
+  }
+
+  /**
+   * Return true if any current player already has `isHost === true`. Used
+   * by {@link onJoin} to decide whether the joiner should be promoted.
+   */
+  private hasHost(): boolean {
+    let found = false;
+    this.state.players.forEach((p) => {
+      if (p.isHost) found = true;
+    });
+    return found;
+  }
+
+  /**
+   * Update {@link GameState.phase} and broadcast {@link
+   * LobbyServerMessage.PhaseChange}. On `lobby → playing` we reset
+   * `readyForNextWave`, set `wave = 1`, and clear any pending countdown.
+   * Enemy spawn lands in Phase 4.
+   */
+  private transitionPhase(from: string, to: string): void {
+    this.state.phase = to;
+    this.broadcast(LobbyServerMessage.PhaseChange, {
+      from,
+      to,
+      at: Date.now(),
+    });
+
+    if (from === "lobby" && to === "playing") {
+      this.state.players.forEach((p) => {
+        p.readyForNextWave = false;
+      });
+      this.state.wave = 1;
+      this._pendingStartAt = 0;
+    }
   }
 }
 

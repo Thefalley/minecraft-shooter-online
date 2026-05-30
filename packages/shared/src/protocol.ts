@@ -200,3 +200,43 @@ export interface SlotSelectPayload {
 export interface ShopBuyPayload {
   offerId: string;
 }
+
+// Phase 2 — lobby & host messages (append-only)
+export const LobbyClientMessage = {
+  CharacterSelect: "vp:lobby:characterSelect",
+  Start: "vp:lobby:start",
+  HostKick: "vp:lobby:hostKick",
+} as const;
+export type LobbyClientMessageName =
+  (typeof LobbyClientMessage)[keyof typeof LobbyClientMessage];
+
+export const LobbyServerMessage = {
+  PhaseChange: "vs:lobby:phaseChange",
+  HostChange: "vs:lobby:hostChange",
+  StartCountdown: "vs:lobby:startCountdown",
+} as const;
+export type LobbyServerMessageName =
+  (typeof LobbyServerMessage)[keyof typeof LobbyServerMessage];
+
+export interface LobbyCharacterSelectPayload {
+  characterId: string; // validated server-side against ALLOWED_CHARACTERS
+}
+export interface LobbyStartPayload {
+  /** Optional countdown override in ms; server clamps to [0, 10000]. */
+  countdownMs?: number;
+}
+export interface LobbyHostKickPayload {
+  sessionId: string;
+}
+export interface LobbyPhaseChangePayload {
+  from: string;
+  to: string;
+  at: number; // Date.now() of transition
+}
+export interface LobbyHostChangePayload {
+  hostSessionId: string;
+}
+export interface LobbyStartCountdownPayload {
+  /** Absolute Date.now() at which the room will flip from lobby → playing. */
+  startsAt: number;
+}
