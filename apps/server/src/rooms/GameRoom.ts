@@ -64,7 +64,7 @@ export class GameRoom extends Room<GameState> {
     console.log(`[GameRoom] created roomCode=${code} roomId=${this.roomId}`);
   }
 
-  static onAuth(_token: string, options: JoinOpts) {
+  static async onAuth(_token: string, options: JoinOpts) {
     if (!isValidName(options.name)) {
       throw new Error("INVALID_NAME");
     }

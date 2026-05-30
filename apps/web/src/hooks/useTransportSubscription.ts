@@ -32,9 +32,9 @@ function installSubscriptions(): void {
 
   unsubscribers.push(
     transport.on("welcome", (payload) => {
-      lobby().setSelfId(payload.sessionId ?? null);
+      lobby().setSelfId(payload.selfId ?? null);
       lobby().setRoomCode(payload.roomCode ?? null);
-      players().setSelfId(payload.sessionId ?? null);
+      players().setSelfId(payload.selfId ?? null);
       players().setRoomCode(payload.roomCode ?? null);
     })
   );

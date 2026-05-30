@@ -12,6 +12,7 @@ out/
 .vercel/
 .idea/
 .vscode/
+.claude/
 *.tsbuildinfo
 coverage/
 .cache/

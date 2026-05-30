@@ -125,7 +125,7 @@ export class ColyseusTransport implements NetworkTransport {
 
     // Wire up server messages.
     room.onMessage(ServerMessage.Welcome, (payload: WelcomePayload) => {
-      this.selfId = payload.sessionId ?? this.selfId;
+      this.selfId = payload.selfId ?? this.selfId;
       this.roomCode = payload.roomCode ?? this.roomCode;
       this.emit("welcome", payload);
     });

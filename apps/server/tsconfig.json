@@ -4,7 +4,7 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "module": "ESNext",
-    "moduleResolution": "Bundler",
+    "moduleResolution": "node",
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "emitDecoratorMetadata": false,

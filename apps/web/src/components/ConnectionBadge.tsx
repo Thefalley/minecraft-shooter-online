@@ -7,6 +7,7 @@ const LABEL: Record<ConnectionStatus, string> = {
   idle: "Inactivo",
   connecting: "Conectando",
   connected: "Conectado",
+  reconnecting: "Reconectando",
   disconnected: "Desconectado",
   error: "Error",
 };
