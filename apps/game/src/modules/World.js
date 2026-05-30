@@ -60,6 +60,18 @@ const NEIGHBOR_OFFSETS = Object.freeze([
   [0, 0, -1],
 ]);
 
+// Module-scope scratch objects reused across hot paths so we never allocate
+// inside a per-frame or per-mutation loop. NEVER hold references to these from
+// outside their immediate use site.
+const _SCRATCH_M4 = new THREE.Matrix4();
+const _RAY_NORMAL = new THREE.Vector3();
+const _RAY_PREV = new THREE.Vector3();
+const _RAY_DIR = new THREE.Vector3();
+
+// Headroom past the bulk-generated instance count, so the player can place a
+// few thousand blocks of any single type before we need to grow the mesh.
+const INSTANCE_HEADROOM = 4096;
+
 function blockKey(x, y, z) {
   return `${x},${y},${z}`;
 }
@@ -106,6 +118,16 @@ export class World extends THREE.Group {
     this.options = { ...DEFAULT_OPTIONS, ...options };
     this.blocks = new Map();
     this.meshes = new Map();
+    // Incremental-update bookkeeping. Populated by both bulk and per-mutation
+    // paths; both must keep them in sync with the InstancedMesh state.
+    //   instanceIndexByKey: Map<key, { type, index }>
+    //     Where the matrix for this block lives. Removed when the block is
+    //     either deleted or hidden by neighbor occlusion.
+    //   instanceKeyByPair:  Map<type, Array<key>>
+    //     Reverse lookup so swap-pop on remove can update the displaced
+    //     block's entry in instanceIndexByKey.
+    this.instanceIndexByKey = new Map();
+    this.instanceKeyByPair = new Map();
     this.time = 0;
 
     this.geometry = new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
@@ -157,7 +179,8 @@ export class World extends THREE.Group {
 
     this.generateTrees();
     this.buildLandmarks();
-    this.rebuildMeshes();
+    this.rebuildMeshesFullBulk();
+    this.populateInstanceIndexAfterBulk();
   }
 
   generateFlat(top = 5) {
@@ -180,7 +203,8 @@ export class World extends THREE.Group {
       }
     }
 
-    this.rebuildMeshes();
+    this.rebuildMeshesFullBulk();
+    this.populateInstanceIndexAfterBulk();
   }
 
   generateTrees() {
@@ -337,63 +361,67 @@ export class World extends THREE.Group {
 
   raycastBlock(origin, direction, maxDistance = 6) {
     const rayOrigin = origin instanceof THREE.Vector3 ? origin : new THREE.Vector3(origin.x, origin.y, origin.z);
-    const rayDirection = direction instanceof THREE.Vector3
-      ? direction.clone()
-      : new THREE.Vector3(direction.x, direction.y, direction.z);
+    // Use a module-scope scratch for the normalized direction inside the loop;
+    // callers do not retain references to it. We still respect the caller's
+    // direction Vector3 (we copy from it, never mutate it).
+    _RAY_DIR.set(direction.x, direction.y, direction.z);
 
-    if (rayDirection.lengthSq() === 0 || maxDistance <= 0) return null;
-    rayDirection.normalize();
+    if (_RAY_DIR.lengthSq() === 0 || maxDistance <= 0) return null;
+    _RAY_DIR.normalize();
 
     let x = Math.floor(rayOrigin.x);
     let y = Math.floor(rayOrigin.y);
     let z = Math.floor(rayOrigin.z);
 
-    const stepX = Math.sign(rayDirection.x);
-    const stepY = Math.sign(rayDirection.y);
-    const stepZ = Math.sign(rayDirection.z);
+    const stepX = Math.sign(_RAY_DIR.x);
+    const stepY = Math.sign(_RAY_DIR.y);
+    const stepZ = Math.sign(_RAY_DIR.z);
 
-    const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / rayDirection.x);
-    const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / rayDirection.y);
-    const tDeltaZ = stepZ === 0 ? Infinity : Math.abs(1 / rayDirection.z);
+    const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / _RAY_DIR.x);
+    const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / _RAY_DIR.y);
+    const tDeltaZ = stepZ === 0 ? Infinity : Math.abs(1 / _RAY_DIR.z);
 
-    let tMaxX = this.nextBoundaryDistance(rayOrigin.x, rayDirection.x, x);
-    let tMaxY = this.nextBoundaryDistance(rayOrigin.y, rayDirection.y, y);
-    let tMaxZ = this.nextBoundaryDistance(rayOrigin.z, rayDirection.z, z);
+    let tMaxX = this.nextBoundaryDistance(rayOrigin.x, _RAY_DIR.x, x);
+    let tMaxY = this.nextBoundaryDistance(rayOrigin.y, _RAY_DIR.y, y);
+    let tMaxZ = this.nextBoundaryDistance(rayOrigin.z, _RAY_DIR.z, z);
     let distance = 0;
-    let normal = new THREE.Vector3(0, 0, 0);
-    let previous = new THREE.Vector3(x, y, z);
+    _RAY_NORMAL.set(0, 0, 0);
+    _RAY_PREV.set(x, y, z);
 
     while (distance <= maxDistance) {
       const type = this.getBlock(x, y, z);
       if (type) {
+        // Callers can hold the returned vectors past the call (e.g. they read
+        // hit.position later in the same frame), so we DO allocate fresh
+        // Vector3s here. Only the in-loop scratches are reused.
         const position = new THREE.Vector3(x, y, z);
-        const point = rayOrigin.clone().addScaledVector(rayDirection, Math.max(0, distance));
+        const point = rayOrigin.clone().addScaledVector(_RAY_DIR, Math.max(0, distance));
         return {
           position,
-          normal: normal.clone(),
-          previous: previous.clone(),
+          normal: _RAY_NORMAL.clone(),
+          previous: _RAY_PREV.clone(),
           point,
           distance,
           type,
         };
       }
 
-      previous.set(x, y, z);
+      _RAY_PREV.set(x, y, z);
       if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
         x += stepX;
         distance = tMaxX;
         tMaxX += tDeltaX;
-        normal.set(-stepX, 0, 0);
+        _RAY_NORMAL.set(-stepX, 0, 0);
       } else if (tMaxY <= tMaxZ) {
         y += stepY;
         distance = tMaxY;
         tMaxY += tDeltaY;
-        normal.set(0, -stepY, 0);
+        _RAY_NORMAL.set(0, -stepY, 0);
       } else {
         z += stepZ;
         distance = tMaxZ;
         tMaxZ += tDeltaZ;
-        normal.set(0, 0, -stepZ);
+        _RAY_NORMAL.set(0, 0, -stepZ);
       }
     }
 
@@ -443,15 +471,61 @@ export class World extends THREE.Group {
     const iz = Math.floor(z);
     const key = blockKey(ix, iy, iz);
 
+    // Removal path -----------------------------------------------------------
     if (type === null || type === undefined) {
-      const removed = this.blocks.delete(key);
-      if (removed && rebuild) this.rebuildMeshes();
-      return removed;
+      const oldType = this.blocks.get(key);
+      if (oldType === undefined) return false;
+      const wasWater = oldType === 'water';
+      this.blocks.delete(key);
+
+      if (!rebuild) return true;
+
+      if (wasWater) {
+        // Water is rendered as a column-top plane sheet; safest to rebuild
+        // the water mesh only. (Water edits are rare in normal gameplay.)
+        this.rebuildWaterMesh();
+        return true;
+      }
+
+      // Free the instance slot of the removed block (if it had one — it
+      // wouldn't if it was occluded).
+      this.removeInstanceAt(ix, iy, iz, oldType);
+      // Removing a block can expose neighbors that were previously fully
+      // surrounded; promote them to visible.
+      this.refreshNeighborVisibility(ix, iy, iz);
+      return true;
     }
 
+    // Add / overwrite path ---------------------------------------------------
     if (!VALID_TYPES.has(type) || iy < 0 || iy >= this.options.maxHeight) return false;
+
+    const oldType = this.blocks.get(key);
+    if (oldType === type) return true; // no-op
     this.blocks.set(key, type);
-    if (rebuild) this.rebuildMeshes();
+
+    if (!rebuild) return true;
+
+    // Replacing water is treated as: water shrinks (rebuild water mesh) + new
+    // solid block appears in this cell (incremental add).
+    if (oldType === 'water') {
+      this.rebuildWaterMesh();
+    } else if (oldType !== undefined) {
+      // Replacing a non-water type: drop the old instance slot first.
+      this.removeInstanceAt(ix, iy, iz, oldType);
+    }
+
+    if (type === 'water') {
+      // New water cell — easiest is to rebuild the water mesh so the column
+      // tops are recomputed correctly.
+      this.rebuildWaterMesh();
+    } else if (this.isRenderableBlockTyped(ix, iy, iz, type)) {
+      this.addInstanceAt(ix, iy, iz, type);
+    }
+
+    // Solid blocks that we just placed may now occlude (or expose) neighbors
+    // (e.g. the cell to the side was visible because we were air, now it's
+    // hidden because we're a solid neighbor on all sides).
+    this.refreshNeighborVisibility(ix, iy, iz);
     return true;
   }
 
@@ -472,7 +546,149 @@ export class World extends THREE.Group {
     return surface === null ? 0 : surface + 1.02;
   }
 
-  rebuildMeshes() {
+  // ---------------------------------------------------------------------------
+  // Incremental InstancedMesh maintenance
+  // ---------------------------------------------------------------------------
+
+  isRenderableBlockTyped(x, y, z, type) {
+    // Same predicate as isRenderableBlock but takes the type as argument so we
+    // skip a redundant Map lookup at call sites that already have it.
+    for (let i = 0; i < NEIGHBOR_OFFSETS.length; i += 1) {
+      const o = NEIGHBOR_OFFSETS[i];
+      const neighbor = this.getBlock(x + o[0], y + o[1], z + o[2]);
+      if (!neighbor) return true;
+      if (type !== 'water' && neighbor === 'water') return true;
+      if (type === 'water' && neighbor !== 'water') return true;
+    }
+    return false;
+  }
+
+  ensureMeshForType(type) {
+    let mesh = this.meshes.get(type);
+    if (mesh) return mesh;
+    // Lazy allocation — sized to a headroom-only capacity, which will grow if
+    // needed via _growMesh().
+    mesh = new THREE.InstancedMesh(this.geometry, this.materials.get(type), INSTANCE_HEADROOM);
+    mesh.name = `World:${type}`;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.count = 0;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.meshes.set(type, mesh);
+    this.instanceKeyByPair.set(type, []);
+    this.add(mesh);
+    return mesh;
+  }
+
+  _growMesh(type, newCapacity) {
+    const old = this.meshes.get(type);
+    const fresh = new THREE.InstancedMesh(this.geometry, this.materials.get(type), newCapacity);
+    fresh.name = old?.name ?? `World:${type}`;
+    fresh.castShadow = old?.castShadow ?? true;
+    fresh.receiveShadow = old?.receiveShadow ?? true;
+    fresh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    if (old) {
+      const oldCount = old.count;
+      for (let i = 0; i < oldCount; i += 1) {
+        old.getMatrixAt(i, _SCRATCH_M4);
+        fresh.setMatrixAt(i, _SCRATCH_M4);
+      }
+      fresh.count = oldCount;
+      this.remove(old);
+      old.dispose?.();
+    } else {
+      fresh.count = 0;
+    }
+    fresh.instanceMatrix.needsUpdate = true;
+    this.meshes.set(type, fresh);
+    this.add(fresh);
+    return fresh;
+  }
+
+  addInstanceAt(x, y, z, type) {
+    const key = blockKey(x, y, z);
+    // If the block is already registered (e.g. add called twice), skip.
+    if (this.instanceIndexByKey.has(key)) return;
+
+    let mesh = this.ensureMeshForType(type);
+    const idx = mesh.count;
+    if (idx >= mesh.instanceMatrix.count) {
+      // Grow the buffer; double capacity to amortize.
+      mesh = this._growMesh(type, Math.max(idx + 1, mesh.instanceMatrix.count * 2));
+    }
+
+    _SCRATCH_M4.makeTranslation(x + 0.5, y + 0.5, z + 0.5);
+    mesh.setMatrixAt(idx, _SCRATCH_M4);
+    mesh.count = idx + 1;
+    mesh.instanceMatrix.needsUpdate = true;
+
+    this.instanceIndexByKey.set(key, { type, index: idx });
+    const keyList = this.instanceKeyByPair.get(type);
+    keyList[idx] = key;
+  }
+
+  removeInstanceAt(x, y, z, type) {
+    const key = blockKey(x, y, z);
+    const entry = this.instanceIndexByKey.get(key);
+    if (!entry) return; // wasn't rendered (occluded or never added)
+    const mesh = this.meshes.get(type);
+    if (!mesh) {
+      this.instanceIndexByKey.delete(key);
+      return;
+    }
+
+    const lastIdx = mesh.count - 1;
+    const targetIdx = entry.index;
+    const keyList = this.instanceKeyByPair.get(type);
+
+    if (targetIdx !== lastIdx) {
+      // Swap-pop: copy the last matrix into the freed slot and patch the
+      // index of the swapped key.
+      mesh.getMatrixAt(lastIdx, _SCRATCH_M4);
+      mesh.setMatrixAt(targetIdx, _SCRATCH_M4);
+      const swappedKey = keyList[lastIdx];
+      keyList[targetIdx] = swappedKey;
+      const swappedEntry = this.instanceIndexByKey.get(swappedKey);
+      if (swappedEntry) swappedEntry.index = targetIdx;
+    }
+
+    keyList.length = lastIdx; // pop
+    mesh.count = lastIdx;
+    mesh.instanceMatrix.needsUpdate = true;
+    this.instanceIndexByKey.delete(key);
+  }
+
+  refreshNeighborVisibility(x, y, z) {
+    // For each of the 6 neighbors of the mutated cell, re-evaluate whether
+    // they should currently be in the InstancedMesh. This handles both
+    // "neighbor was hidden, now exposed" (add) and "neighbor was visible, now
+    // fully buried" (remove).
+    for (let i = 0; i < NEIGHBOR_OFFSETS.length; i += 1) {
+      const o = NEIGHBOR_OFFSETS[i];
+      const nx = x + o[0];
+      const ny = y + o[1];
+      const nz = z + o[2];
+      const nType = this.blocks.get(blockKey(nx, ny, nz));
+      if (nType === undefined || nType === 'water') continue;
+      const nKey = blockKey(nx, ny, nz);
+      const has = this.instanceIndexByKey.has(nKey);
+      const shouldRender = this.isRenderableBlockTyped(nx, ny, nz, nType);
+      if (shouldRender && !has) {
+        this.addInstanceAt(nx, ny, nz, nType);
+      } else if (!shouldRender && has) {
+        this.removeInstanceAt(nx, ny, nz, nType);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bulk paths
+  // ---------------------------------------------------------------------------
+
+  // Legacy full rebuild kept for the bulk generate() / generateFlat() codepath
+  // — building 30K instances individually is slower than this one-shot pass.
+  rebuildMeshesFullBulk() {
     this.clearMeshes();
 
     const blocksByType = new Map(Object.keys(BLOCK_TYPES).map((type) => [type, []]));
@@ -484,24 +700,27 @@ export class World extends THREE.Group {
         if (this.getBlock(x, y + 1, z) !== 'water') waterTops.push([x, y, z]);
         continue;
       }
-      if (this.isRenderableBlock(x, y, z, type)) {
+      if (this.isRenderableBlockTyped(x, y, z, type)) {
         blocksByType.get(type)?.push([x, y, z]);
       }
     }
 
-    const matrix = new THREE.Matrix4();
     for (const [type, positions] of blocksByType) {
       if (type === 'water' || positions.length === 0) continue;
 
-      const mesh = new THREE.InstancedMesh(this.geometry, this.materials.get(type), positions.length);
+      const capacity = positions.length + INSTANCE_HEADROOM;
+      const mesh = new THREE.InstancedMesh(this.geometry, this.materials.get(type), capacity);
       mesh.name = `World:${type}`;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.count = positions.length;
 
-      positions.forEach(([x, y, z], index) => {
-        matrix.makeTranslation(x + 0.5, y + 0.5, z + 0.5);
-        mesh.setMatrixAt(index, matrix);
-      });
+      for (let i = 0; i < positions.length; i += 1) {
+        const p = positions[i];
+        _SCRATCH_M4.makeTranslation(p[0] + 0.5, p[1] + 0.5, p[2] + 0.5);
+        mesh.setMatrixAt(i, _SCRATCH_M4);
+      }
 
       mesh.instanceMatrix.needsUpdate = true;
       this.meshes.set(type, mesh);
@@ -509,17 +728,95 @@ export class World extends THREE.Group {
     }
 
     if (waterTops.length > 0) {
-      const water = new THREE.InstancedMesh(this.waterGeometry, this.materials.get('water'), waterTops.length);
+      const water = new THREE.InstancedMesh(
+        this.waterGeometry,
+        this.materials.get('water'),
+        waterTops.length + INSTANCE_HEADROOM,
+      );
       water.name = 'World:water';
       water.receiveShadow = true;
-      waterTops.forEach(([x, y, z], index) => {
-        matrix.makeTranslation(x + 0.5, y + 0.96, z + 0.5);
-        water.setMatrixAt(index, matrix);
-      });
+      water.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      water.count = waterTops.length;
+      for (let i = 0; i < waterTops.length; i += 1) {
+        const p = waterTops[i];
+        _SCRATCH_M4.makeTranslation(p[0] + 0.5, p[1] + 0.96, p[2] + 0.5);
+        water.setMatrixAt(i, _SCRATCH_M4);
+      }
       water.instanceMatrix.needsUpdate = true;
       this.meshes.set('water', water);
       this.add(water);
     }
+  }
+
+  // After the bulk rebuild, seed instanceIndexByKey + instanceKeyByPair so the
+  // incremental setBlock() path can take over without inconsistencies.
+  populateInstanceIndexAfterBulk() {
+    this.instanceIndexByKey.clear();
+    this.instanceKeyByPair.clear();
+
+    // We re-walk the blocks map in the same iteration order the bulk path
+    // used. Maps in JS preserve insertion order, and since we filtered with
+    // identical isRenderableBlockTyped predicates the indices line up.
+    const counters = new Map();
+    for (const type of Object.keys(BLOCK_TYPES)) {
+      if (this.meshes.has(type)) this.instanceKeyByPair.set(type, []);
+      counters.set(type, 0);
+    }
+
+    for (const [key, type] of this.blocks) {
+      if (type === 'water') continue; // water is rendered via column-top plane
+      const [x, y, z] = parseBlockKey(key);
+      if (!this.isRenderableBlockTyped(x, y, z, type)) continue;
+      const idx = counters.get(type);
+      counters.set(type, idx + 1);
+      this.instanceIndexByKey.set(key, { type, index: idx });
+      const list = this.instanceKeyByPair.get(type);
+      if (list) list[idx] = key;
+    }
+  }
+
+  // Rebuilds ONLY the water mesh from scratch. Used after water cell edits,
+  // which are infrequent and complex (column-top plane requires re-scanning).
+  rebuildWaterMesh() {
+    const existing = this.meshes.get('water');
+    if (existing) {
+      this.remove(existing);
+      existing.dispose?.();
+      this.meshes.delete('water');
+    }
+
+    const waterTops = [];
+    for (const [key, type] of this.blocks) {
+      if (type !== 'water') continue;
+      const [x, y, z] = parseBlockKey(key);
+      if (this.getBlock(x, y + 1, z) !== 'water') waterTops.push([x, y, z]);
+    }
+    if (waterTops.length === 0) return;
+
+    const water = new THREE.InstancedMesh(
+      this.waterGeometry,
+      this.materials.get('water'),
+      waterTops.length + INSTANCE_HEADROOM,
+    );
+    water.name = 'World:water';
+    water.receiveShadow = true;
+    water.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    water.count = waterTops.length;
+    for (let i = 0; i < waterTops.length; i += 1) {
+      const p = waterTops[i];
+      _SCRATCH_M4.makeTranslation(p[0] + 0.5, p[1] + 0.96, p[2] + 0.5);
+      water.setMatrixAt(i, _SCRATCH_M4);
+    }
+    water.instanceMatrix.needsUpdate = true;
+    this.meshes.set('water', water);
+    this.add(water);
+  }
+
+  // Backwards-compat alias: some code paths or external callers might still
+  // expect rebuildMeshes(). Route it to the bulk path (the safer choice).
+  rebuildMeshes() {
+    this.rebuildMeshesFullBulk();
+    this.populateInstanceIndexAfterBulk();
   }
 
   clearMeshes() {
@@ -528,6 +825,8 @@ export class World extends THREE.Group {
       mesh.dispose?.();
     }
     this.meshes.clear();
+    this.instanceIndexByKey.clear();
+    this.instanceKeyByPair.clear();
   }
 
   nextBoundaryDistance(value, direction, cell) {
@@ -536,14 +835,10 @@ export class World extends THREE.Group {
     return Infinity;
   }
 
+  // Original predicate kept for any external callers; new code uses the
+  // -Typed variant to skip a redundant Map lookup.
   isRenderableBlock(x, y, z, type) {
-    for (const [ox, oy, oz] of NEIGHBOR_OFFSETS) {
-      const neighbor = this.getBlock(x + ox, y + oy, z + oz);
-      if (!neighbor) return true;
-      if (type !== 'water' && neighbor === 'water') return true;
-      if (type === 'water' && neighbor !== 'water') return true;
-    }
-    return false;
+    return this.isRenderableBlockTyped(x, y, z, type);
   }
 
   dispose() {

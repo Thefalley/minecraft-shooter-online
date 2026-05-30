@@ -118,4 +118,90 @@ export function createBlockMaterials(blockTypes) {
   return materials;
 }
 
+// Builds a single 64x64 atlas canvas containing all 8 block textures arranged
+// in a deterministic 4-column x 2-row grid. Each tile is 16x16 (the source
+// texture size). Returns the THREE.CanvasTexture plus a `uvOffsets` map whose
+// values are the [u, v] of the tile's bottom-left corner in UV space (Three.js
+// UVs are bottom-up, so v=0 is the bottom of the canvas).
+//
+// Layout (top row = atlas pixel row 0..15, bottom row = pixel row 16..31):
+//   col:    0          1          2          3
+//   row 0:  grass_top  grass_side dirt       stone
+//   row 1:  sand       wood       leaves     water
+//
+// This atlas is exported for future per-instance-UV InstancedMesh wiring. The
+// current World.js renderer keeps using createBlockMaterials() because the
+// shared atlas + per-instance UV offset shader patch would require also
+// handling grass's per-face texture split — too invasive for one commit.
+const ATLAS_COLS = 4;
+const ATLAS_ROWS = 2;
+const ATLAS_SIZE = SIZE * ATLAS_COLS; // 64
+
+const ATLAS_LAYOUT = [
+  // [name, drawFn, col, row]
+  ['grass_top', drawGrassTop, 0, 0],
+  ['grass_side', drawGrassSide, 1, 0],
+  ['dirt', drawDirt, 2, 0],
+  ['stone', drawStone, 3, 0],
+  ['sand', drawSand, 0, 1],
+  ['wood', drawWood, 1, 1],
+  ['leaves', drawLeaves, 2, 1],
+  ['water', drawWater, 3, 1],
+];
+
+let atlas = null;
+
+export function createBlockAtlas() {
+  if (atlas) return atlas;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = ATLAS_SIZE;
+  canvas.height = SIZE * ATLAS_ROWS; // 32
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  // Each tile is rendered onto a tiny scratch canvas first (so the per-tile
+  // drawing functions can keep using their full-canvas fills) and then blitted
+  // into the atlas at the correct slot.
+  const tile = document.createElement('canvas');
+  tile.width = SIZE;
+  tile.height = SIZE;
+  const tileCtx = tile.getContext('2d');
+  tileCtx.imageSmoothingEnabled = false;
+
+  const uvOffsets = {};
+  const tileU = 1 / ATLAS_COLS;
+  const tileV = 1 / ATLAS_ROWS;
+
+  for (const [name, drawFn, col, row] of ATLAS_LAYOUT) {
+    tileCtx.clearRect(0, 0, SIZE, SIZE);
+    drawFn(tileCtx);
+    // Canvas y grows downward; UV v grows upward. Row 0 lives at canvas y=0
+    // which corresponds to the TOP of the atlas in UV space (v near 1).
+    const canvasY = row * SIZE;
+    ctx.drawImage(tile, col * SIZE, canvasY);
+    const uOffset = col * tileU;
+    const vOffset = 1 - (row + 1) * tileV; // bottom-left V of this tile
+    uvOffsets[name] = [uOffset, vOffset];
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestMipmapNearestFilter;
+  texture.generateMipmaps = true;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.needsUpdate = true;
+
+  atlas = {
+    texture,
+    uvOffsets,
+    tileSize: { u: tileU, v: tileV },
+    cols: ATLAS_COLS,
+    rows: ATLAS_ROWS,
+  };
+  return atlas;
+}
+
 export default createBlockMaterials;
