@@ -7,7 +7,7 @@ services:
     rootDir: .
     buildCommand: |
       npm install -g pnpm@9.15.0
-      pnpm install --ignore-scripts
+      pnpm install --ignore-scripts --no-prod
       pnpm --filter @mvp/server build
     startCommand: pnpm --filter @mvp/server start
     healthCheckPath: /health
