@@ -13,7 +13,9 @@ import {
   ROOM_CODE_LENGTH,
 } from "@mvp/shared";
 
-const ALLOWED_CHARACTERS = new Set(["mage", "knight", "ranger", "rogue"]);
+// Must match CharacterId in packages/shared/src/types.ts and the CHARACTERS
+// array in apps/game/src/modules/Characters.js.
+const ALLOWED_CHARACTERS = new Set(["duck", "knight", "hunter", "samurai", "mage"]);
 
 function safeUrl() {
   if (typeof window === "undefined") return null;
