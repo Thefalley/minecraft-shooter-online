@@ -153,11 +153,29 @@ export class MultiplayerCoordinator {
 
     off("status", (s) => {
       if (s === "disconnected" || s === "error") {
-        // Best-effort cleanup; the Game's onExit handler will route back to
-        // the menu when the user closes the run.
+        // Cleanup remote players and notify the host (main.js) so it can
+        // route back to the menu. Without this, Game stays mid-tick with
+        // networkAuthority='server' but no inputs flowing → player frozen
+        // forever.
         this._registry?.clear();
+        if (typeof this._onDisconnect === "function") {
+          try {
+            this._onDisconnect(s);
+          } catch (err) {
+            console.warn("[coord] onDisconnect handler threw", err);
+          }
+        }
       }
     });
+  }
+
+  /**
+   * Register a callback fired when the bridge transitions to
+   * 'disconnected' or 'error'. main.js uses this to tear down the Game
+   * and bounce back to the menu.
+   */
+  onDisconnect(fn) {
+    this._onDisconnect = fn;
   }
 
   _unwireBridge() {

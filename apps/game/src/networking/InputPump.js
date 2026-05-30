@@ -77,7 +77,14 @@ export class InputPump {
 
     if (same && now - this._lastT < KEEPALIVE_MS) return;
 
-    const payload = { ...cmd, seq: ++this._seq };
+    // CSP reconciliation needs the SAME seq the client recorded against its
+    // ring buffer. Player.buildInputCommand() assigns cmd.seq from its own
+    // monotonic counter — honor it. Only fall back to a pump-side seq if the
+    // caller didn't bring one (e.g. a non-Voxel-Dragons sender).
+    const payload =
+      typeof cmd.seq === 'number' && Number.isFinite(cmd.seq)
+        ? { ...cmd }
+        : { ...cmd, seq: ++this._seq };
     try {
       this._send(payload);
     } catch {

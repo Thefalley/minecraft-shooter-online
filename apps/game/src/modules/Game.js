@@ -398,6 +398,16 @@ export class Game {
     if (this.network && this.player && typeof this.player.buildInputCommand === 'function') {
       const cmd = this.player.buildInputCommand(this.input, delta);
       this.network.pushInput(cmd);
+      // CSP: Player.update() early-returns when networkAuthority='server'.
+      // Drive the same input pipeline locally so the player still moves at
+      // 60 Hz with zero perceived latency. The server snapshot reconciles via
+      // applyServerSnapshot() when it arrives.
+      if (typeof this.player.applyInput === 'function' && this.player.networkAuthority === 'server') {
+        this.player.applyInput(cmd, delta, this.world);
+        if (typeof this.player.recordSnapshot === 'function') {
+          this.player.recordSnapshot(cmd);
+        }
+      }
     }
     this.player.update(delta, this.input, this.world);
     this.clampPlayerToBounds();

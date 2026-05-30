@@ -62,7 +62,22 @@ async function startMultiplayer({ name, code, characterId, mode }) {
     stats = new StatsOverlay();
     stats.mount();
 
+    // If the URL hinted at a character (via the lobby flow), tell the
+    // server up front so other clients render it correctly even before the
+    // user clicks a card.
+    if (initialCharacter?.id && typeof bridge.emitCharacterSelect === 'function') {
+      bridge.emitCharacterSelect(initialCharacter.id);
+    }
+
+    // If the bridge fails / disconnects mid-game, route the user back to
+    // the menu instead of leaving them frozen on a half-rendered scene.
+    coordinator.onDisconnect?.((status) => {
+      console.warn('[mp] coordinator disconnected:', status);
+      teardown().finally(() => showMenu());
+    });
+
     waitingRoom = new WaitingRoom(root, bridge, {
+      initialCharacterId: initialCharacter.id,
       onStart: () => {
         try { waitingRoom?.dispose(); } catch { /* ignore */ }
         waitingRoom = null;

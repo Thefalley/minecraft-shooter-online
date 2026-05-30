@@ -239,9 +239,37 @@ export class GameRoom extends Room<GameState> {
       { except: client },
     );
 
+    // Late joiners: if the room is already past 'lobby', tell the new client
+    // immediately so its WaitingRoom doesn't hang. Without this, the bridge
+    // never receives a PhaseChange and the UI stays stuck on the host.
+    if (this.state.phase !== "lobby") {
+      client.send(LobbyServerMessage.PhaseChange, {
+        from: this.state.phase,
+        to: this.state.phase,
+        at: Date.now(),
+      });
+    }
+
+    // Mirror the current host so the new client paints the crown correctly.
+    const hostEntry = this.findHost();
+    if (hostEntry) {
+      client.send(LobbyServerMessage.HostChange, {
+        hostSessionId: hostEntry.sessionId,
+      });
+    }
+
     console.log(
       `[GameRoom ${this.state.roomCode}] +join ${name} (${client.sessionId}) total=${this.state.players.size}`,
     );
+  }
+
+  /** Returns the {sessionId, player} of the current host, or null. */
+  private findHost(): { sessionId: string; player: VoxelPlayer } | null {
+    let result: { sessionId: string; player: VoxelPlayer } | null = null;
+    this.state.players.forEach((p, sid) => {
+      if (!result && p.isHost) result = { sessionId: sid, player: p };
+    });
+    return result;
   }
 
   async onLeave(client: Client, consented: boolean): Promise<void> {
@@ -626,6 +654,11 @@ export class GameRoom extends Room<GameState> {
       if (input.backward) mz += 1;
       if (input.left) mx -= 1;
       if (input.right) mx += 1;
+
+      // Stamp the seq the client already recorded against its prediction
+      // ring buffer so the client can find the matching local snapshot on
+      // reconciliation (Phase 2 CSP fix).
+      player.seq = input.seq;
 
       if (mx === 0 && mz === 0) {
         player.rotationY = input.rotationY;

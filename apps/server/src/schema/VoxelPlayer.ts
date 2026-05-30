@@ -26,6 +26,10 @@ export class VoxelPlayer extends Schema {
   @type("number") vy: number = 0;
   @type("number") vz: number = 0;
 
+  // Last applied input sequence — clients use this to find the matching
+  // entry in their local prediction ring buffer for reconciliation.
+  @type("uint32") seq: number = 0;
+
   // Combat stats.
   @type("number") health: number = 100;
   @type("number") maxHealth: number = 100;
