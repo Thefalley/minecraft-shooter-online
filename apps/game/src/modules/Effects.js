@@ -7,6 +7,161 @@ const DEFAULT_FOG_FAR = 340;
 const TMP_COLOR = new THREE.Color();
 const TMP_VECTOR = new THREE.Vector3();
 
+// ---------------------------------------------------------------------------
+// Module-level pools.
+//
+// Per-effect 'new THREE.XGeometry' / 'new THREE.MeshBasicMaterial' / 'new
+// THREE.BufferGeometry' on every shot was the dominant source of GC churn
+// while multiple players were firing automatic weapons. Everything below
+// makes those calls shared.
+// ---------------------------------------------------------------------------
+
+// Shared geometries. Meshes use these via mesh.scale.* to take on whatever
+// per-effect size they need; the underlying buffers are never re-uploaded.
+const _SPHERE_LO = new THREE.SphereGeometry(1, 6, 6);     // impact / tracer
+const _SPHERE_HI = new THREE.SphereGeometry(1, 14, 10);   // explosion core
+const _PLANE_1 = new THREE.PlaneGeometry(1, 1);            // slashMark
+const _RING_1 = new THREE.RingGeometry(0.5, 1, 24);        // shockwave
+_RING_1.rotateX(-Math.PI / 2);                              // bake flat orientation
+const _CYL_1 = new THREE.CylinderGeometry(1, 1, 1, 12, 1, true); // beam
+
+// Material pool for STATIC-opacity uses keyed by colour+blending+opacityBucket.
+// Effects with smooth opacity fades can't share a material safely (one effect
+// writing opacity stomps the other on the same frame), so they allocate their
+// own — see `_acquireFadingMaterial` for the small ring of those.
+const _materialPool = new Map();
+function _materialKey(color, blending, opacity, side, depthTest) {
+  // Bucket opacity to 0.05 to limit pool growth.
+  const bucket = Math.round(opacity * 20) / 20;
+  return `${color}|${blending}|${bucket}|${side}|${depthTest ? 1 : 0}`;
+}
+function getEffectMaterial(color, blending = THREE.NormalBlending, opacity = 1, options = {}) {
+  const side = options.side ?? THREE.FrontSide;
+  const depthTest = options.depthTest !== false;
+  const key = _materialKey(color, blending, opacity, side, depthTest);
+  let m = _materialPool.get(key);
+  if (!m) {
+    m = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: Math.round(opacity * 20) / 20,
+      depthWrite: false,
+      depthTest,
+      side,
+      blending,
+    });
+    _materialPool.set(key, m);
+  }
+  return m;
+}
+
+// Fading material pool: small ring per key. Effects that need smooth opacity
+// animation rotate through these so they (mostly) don't fight each other for
+// a single shared material. If the ring is exhausted simultaneously, the
+// older effect's last frames may have their opacity overwritten — visually
+// indistinguishable in practice given how brief the fades are.
+const _FADING_RING = 8;
+const _fadingMaterialPool = new Map(); // key -> { ring: Material[], cursor: number }
+function _acquireFadingMaterial(color, blending, baseOpacity, options = {}) {
+  const side = options.side ?? THREE.FrontSide;
+  const depthTest = options.depthTest !== false;
+  const map = options.map ?? null;
+  // Texture-bearing materials don't share — their map identity is part of the
+  // material. We DO still pool by (color,blending,side,depthTest) when the
+  // map matches (slashMark always uses the same single texture).
+  const mapId = map ? map.uuid : 'nomap';
+  const key = `fade|${color}|${blending}|${side}|${depthTest ? 1 : 0}|${mapId}`;
+  let entry = _fadingMaterialPool.get(key);
+  if (!entry) {
+    entry = { ring: [], cursor: 0 };
+    _fadingMaterialPool.set(key, entry);
+  }
+  if (entry.ring.length < _FADING_RING) {
+    const m = new THREE.MeshBasicMaterial({
+      color,
+      map,
+      transparent: true,
+      opacity: baseOpacity,
+      depthWrite: false,
+      depthTest,
+      side,
+      blending,
+    });
+    entry.ring.push(m);
+    return m;
+  }
+  const m = entry.ring[entry.cursor];
+  entry.cursor = (entry.cursor + 1) % entry.ring.length;
+  m.opacity = baseOpacity;
+  return m;
+}
+
+// Particle BufferGeometry ring. Each entry owns Float32Arrays for position
+// and color sized for up to 64 vertices. _spawnBurst writes into them and
+// flips needsUpdate. If all 8 are still mid-burst we fall back to allocating
+// a fresh geometry/arrays — dropping the effect would be worse than the
+// occasional GC.
+const _PARTICLE_RING_SIZE = 8;
+const _PARTICLE_CAP = 64;
+const _particleRing = [];
+let _particleRingCursor = 0;
+let _particleRingInUse = 0;
+function _acquireParticleGeometry(count) {
+  if (count > _PARTICLE_CAP || _particleRingInUse >= _PARTICLE_RING_SIZE) {
+    // Allocate fresh, mark as un-pooled. Caller must dispose normally.
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    return { geometry, positions, colors, pooled: false, slot: -1 };
+  }
+  // Find a free slot.
+  let slot = _particleRingCursor;
+  for (let i = 0; i < _PARTICLE_RING_SIZE; i += 1) {
+    const candidate = (_particleRingCursor + i) % _PARTICLE_RING_SIZE;
+    if (!_particleRing[candidate] || !_particleRing[candidate].inUse) {
+      slot = candidate;
+      break;
+    }
+  }
+  _particleRingCursor = (slot + 1) % _PARTICLE_RING_SIZE;
+
+  let entry = _particleRing[slot];
+  if (!entry) {
+    const positions = new Float32Array(_PARTICLE_CAP * 3);
+    const colors = new Float32Array(_PARTICLE_CAP * 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    entry = { geometry, positions, colors, inUse: false };
+    _particleRing[slot] = entry;
+  }
+  entry.inUse = true;
+  _particleRingInUse += 1;
+  // Trim draw range to actual particle count so the leftover capacity isn't
+  // rendered as junk vertices from the previous burst.
+  entry.geometry.setDrawRange(0, count);
+  return { geometry: entry.geometry, positions: entry.positions, colors: entry.colors, pooled: true, slot };
+}
+function _releaseParticleGeometry(slot) {
+  if (slot < 0) return;
+  const entry = _particleRing[slot];
+  if (!entry || !entry.inUse) return;
+  entry.inUse = false;
+  _particleRingInUse -= 1;
+}
+
+// Scratch quaternions/vectors lifted out of hot paths (slashMark, _spawnBurst).
+const _SCRATCH_Q = new THREE.Quaternion();
+const _SCRATCH_AXIS_Z = new THREE.Vector3(0, 0, 1);
+const _SCRATCH_Q_CAM = new THREE.Quaternion();
+const _SCRATCH_UP = new THREE.Vector3(0, 1, 0);
+const _SCRATCH_DIR = new THREE.Vector3();
+const _SCRATCH_JITTER = new THREE.Vector3();
+const _SCRATCH_WHITE = new THREE.Color(0xffffff);
+const _SCRATCH_AXIS = new THREE.Vector3();
+
 function resolvePosition(position) {
   if (position?.isVector3) return position.clone();
   if (position?.position?.isVector3) return position.position.clone();
@@ -16,20 +171,28 @@ function resolvePosition(position) {
   return new THREE.Vector3();
 }
 
-function randomDirection() {
+// Writes a uniformly-distributed unit direction into target without
+// allocating. Returns target for chaining.
+function randomDirectionInto(target) {
   const theta = Math.random() * Math.PI * 2;
   const y = Math.random() * 2 - 1;
   const radius = Math.sqrt(Math.max(0, 1 - y * y));
-  return TMP_VECTOR.set(Math.cos(theta) * radius, y, Math.sin(theta) * radius).clone();
+  target.set(Math.cos(theta) * radius, y, Math.sin(theta) * radius);
+  return target;
 }
 
 function disposeObject(object) {
   object?.traverse?.((child) => {
-    child.geometry?.dispose?.();
-    if (Array.isArray(child.material)) {
-      child.material.forEach((material) => material.dispose?.());
-    } else {
-      child.material?.dispose?.();
+    // Skip dispose on shared resources — that would tear them out from under
+    // every other effect using them.
+    if (!child._pooledGeometry) child.geometry?.dispose?.();
+    const skipMat = child._pooledMaterial;
+    if (!skipMat) {
+      if (Array.isArray(child.material)) {
+        child.material.forEach((material) => material.dispose?.());
+      } else {
+        child.material?.dispose?.();
+      }
     }
   });
 }
@@ -64,6 +227,16 @@ export class Effects {
       fogNear: options.fogNear ?? DEFAULT_FOG_NEAR,
       fogFar: options.fogFar ?? DEFAULT_FOG_FAR,
     };
+
+    this.effectCap = 90;
+  }
+
+  // Allow the caller (e.g. multiplayer match start) to dial the concurrent
+  // effect cap down when many players are firing automatic weapons.
+  setEffectCap(n) {
+    if (typeof n === 'number' && n > 0) {
+      this.effectCap = Math.floor(n);
+    }
   }
 
   impact(position, color = 0xffd166) {
@@ -128,17 +301,14 @@ export class Effects {
     if (distance < 0.001) return;
     const dir = axis.clone().normalize();
 
-    const geometry = new THREE.SphereGeometry(radius, 6, 6);
-    const material = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.95,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
+    // Tracer opacity is constant for its whole life — safe to share material.
+    const material = getEffectMaterial(color, THREE.AdditiveBlending, 0.95);
+    const mesh = new THREE.Mesh(_SPHERE_LO, material);
+    mesh.scale.setScalar(radius);
     mesh.position.copy(from);
     mesh.frustumCulled = false;
+    mesh._pooledGeometry = true;
+    mesh._pooledMaterial = true;
     this.scene.add(mesh);
 
     const travelTime = Math.max(0.03, distance / speed);
@@ -167,25 +337,25 @@ export class Effects {
     if (!this.scene) return;
 
     const pos = resolvePosition(position);
-    const material = new THREE.MeshBasicMaterial({
-      map: this._getSlashTexture(),
-      color,
-      transparent: true,
-      opacity: 1,
-      depthWrite: false,
+    // Opacity fades smoothly — needs a non-shared material so two slashMarks
+    // don't write opacity on the same frame. Pulled from the small fading ring.
+    const material = _acquireFadingMaterial(color, THREE.AdditiveBlending, 1, {
       depthTest: false,
-      blending: THREE.AdditiveBlending,
+      map: this._getSlashTexture(),
     });
-    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size, size), material);
+    const mesh = new THREE.Mesh(_PLANE_1, material);
     mesh.position.copy(pos);
+    mesh.scale.setScalar(size);
     mesh.frustumCulled = false;
     mesh.renderOrder = 1000;
+    mesh._pooledGeometry = true;
+    mesh._pooledMaterial = true; // pooled (fading ring) — don't dispose
     this.scene.add(mesh);
 
     const camera = this.camera;
     const roll = Math.random() * Math.PI * 2;
-    const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), roll);
-    const camQuat = new THREE.Quaternion();
+    // Reuse the scratch quaternion for the roll; multiply it onto camQuat in update.
+    const rollQuat = new THREE.Quaternion().setFromAxisAngle(_SCRATCH_AXIS_Z, roll);
     const ttl = 0.6;
     const effect = {
       object: mesh,
@@ -195,10 +365,12 @@ export class Effects {
         effect.age += delta;
         const progress = THREE.MathUtils.clamp(effect.age / ttl, 0, 1);
         if (camera) {
-          camera.getWorldQuaternion(camQuat);
-          mesh.quaternion.copy(camQuat).multiply(rollQuat);
+          camera.getWorldQuaternion(_SCRATCH_Q_CAM);
+          mesh.quaternion.copy(_SCRATCH_Q_CAM).multiply(rollQuat);
         }
-        mesh.scale.setScalar(1 + progress * 0.35);
+        // The original scaled by 1 + progress * 0.35 around base size. We
+        // bake the size into the base so the curve is still size*(1+...).
+        mesh.scale.setScalar(size * (1 + progress * 0.35));
         material.opacity = 1 - progress * progress;
         return progress < 1;
       },
@@ -211,19 +383,15 @@ export class Effects {
     if (!this.scene) return;
 
     const pos = resolvePosition(center);
-    const geometry = new THREE.RingGeometry(0.6, 1, 44);
-    geometry.rotateX(-Math.PI / 2); // lay flat on the ground
-    const material = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.75,
+    // Animated opacity → fading pool.
+    const material = _acquireFadingMaterial(color, THREE.AdditiveBlending, 0.75, {
       side: THREE.DoubleSide,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
     });
-    const mesh = new THREE.Mesh(geometry, material);
+    const mesh = new THREE.Mesh(_RING_1, material);
     mesh.position.copy(pos);
     mesh.frustumCulled = false;
+    mesh._pooledGeometry = true;
+    mesh._pooledMaterial = true;
     this.scene.add(mesh);
 
     const ttl = 0.5;
@@ -285,18 +453,17 @@ export class Effects {
     const length = axis.length();
     if (length < 0.001) return;
 
-    const geometry = new THREE.CylinderGeometry(0.07, 0.07, length, 8, 1, true);
-    const material = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.9,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
+    // Animated opacity → fading pool. Geometry is unit cylinder scaled to fit.
+    const material = _acquireFadingMaterial(color, THREE.AdditiveBlending, 0.9);
+    const mesh = new THREE.Mesh(_CYL_1, material);
+    // Original radius was 0.07, length varies. Scale unit cylinder accordingly.
+    mesh.scale.set(0.07, length, 0.07);
     mesh.position.copy(from).addScaledVector(axis, 0.5);
-    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.clone().normalize());
+    _SCRATCH_AXIS.copy(axis).normalize();
+    mesh.quaternion.setFromUnitVectors(_SCRATCH_UP, _SCRATCH_AXIS);
     mesh.frustumCulled = false;
+    mesh._pooledGeometry = true;
+    mesh._pooledMaterial = true;
     this.scene.add(mesh);
 
     const ttl = 0.16;
@@ -324,6 +491,9 @@ export class Effects {
       const alive = effect.update(dt);
       if (!alive) {
         this.scene?.remove?.(effect.object);
+        // Effect-specific release hooks run BEFORE generic dispose so the
+        // particle ring slot is freed even when dispose skips pooled geo.
+        effect.onRelease?.();
         disposeObject(effect.object);
         this.effects.splice(i, 1);
       }
@@ -415,6 +585,7 @@ export class Effects {
 
     for (const effect of this.effects) {
       this.scene?.remove?.(effect.object);
+      effect.onRelease?.();
       disposeObject(effect.object);
     }
     this.effects.length = 0;
@@ -426,36 +597,60 @@ export class Effects {
   }
 
   _spawnBurst(config) {
-    if (this.effects.length > 90) return; // safety cap to avoid GC spikes on heavy multi-hits
-    const positions = new Float32Array(config.count * 3);
-    const colors = new Float32Array(config.count * 3);
+    if (this.effects.length > this.effectCap) return; // safety cap to avoid GC spikes on heavy multi-hits
+
+    const handle = _acquireParticleGeometry(config.count);
+    const positions = handle.positions;
+    const colors = handle.colors;
     const velocities = [];
     const baseColor = TMP_COLOR.set(config.color);
     const liftBias = config.liftBias ?? 0;
 
     for (let i = 0; i < config.count; i += 1) {
       const index = i * 3;
-      const jitter = randomDirection().multiplyScalar(Math.random() * 0.08);
-      positions[index] = config.position.x + jitter.x;
-      positions[index + 1] = config.position.y + jitter.y;
-      positions[index + 2] = config.position.z + jitter.z;
+      // Jitter: scratch vector reused, scaled in place. No clone().
+      randomDirectionInto(_SCRATCH_JITTER).multiplyScalar(Math.random() * 0.08);
+      positions[index] = config.position.x + _SCRATCH_JITTER.x;
+      positions[index + 1] = config.position.y + _SCRATCH_JITTER.y;
+      positions[index + 2] = config.position.z + _SCRATCH_JITTER.z;
 
-      const direction = randomDirection();
-      direction.y += liftBias;
-      direction.normalize();
+      // Each particle's velocity vector needs to be retained per-particle, so
+      // we still allocate one Vector3 per particle for the velocity array.
+      // That's much smaller than the previous per-burst overhead.
+      const dirX = (Math.random() * 2 - 1);
+      const dirY = (Math.random() * 2 - 1) + liftBias;
+      const dirZ = (Math.random() * 2 - 1);
+      // Renormalise without allocations.
+      _SCRATCH_DIR.set(dirX, dirY, dirZ);
+      if (_SCRATCH_DIR.lengthSq() < 1e-6) _SCRATCH_DIR.set(0, 1, 0);
+      _SCRATCH_DIR.normalize();
       const speed = THREE.MathUtils.lerp(config.speed[0], config.speed[1], Math.random());
-      velocities.push(direction.multiplyScalar(speed));
+      velocities.push(new THREE.Vector3(
+        _SCRATCH_DIR.x * speed,
+        _SCRATCH_DIR.y * speed,
+        _SCRATCH_DIR.z * speed,
+      ));
 
-      const color = baseColor.clone().lerp(new THREE.Color(0xffffff), Math.random() * 0.18);
-      colors[index] = color.r;
-      colors[index + 1] = color.g;
-      colors[index + 2] = color.b;
+      // Mix base colour with white using TMP_COLOR / scratch — no per-particle
+      // Color allocations.
+      const mix = Math.random() * 0.18;
+      colors[index]     = baseColor.r + (_SCRATCH_WHITE.r - baseColor.r) * mix;
+      colors[index + 1] = baseColor.g + (_SCRATCH_WHITE.g - baseColor.g) * mix;
+      colors[index + 2] = baseColor.b + (_SCRATCH_WHITE.b - baseColor.b) * mix;
     }
 
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const geometry = handle.geometry;
+    geometry.getAttribute('position').needsUpdate = true;
+    geometry.getAttribute('color').needsUpdate = true;
+    if (handle.pooled) {
+      // Limit how much of the shared buffer is drawn this burst.
+      geometry.setDrawRange(0, config.count);
+    }
 
+    // PointsMaterial has per-burst animated opacity AND size, plus the
+    // vertexColors flag. Pooling these would need (color,blending) plus
+    // independent opacity/size per burst, which defeats sharing. We allocate
+    // it fresh — geometry is the bigger win.
     const material = new THREE.PointsMaterial({
       size: config.size,
       vertexColors: true,
@@ -467,8 +662,12 @@ export class Effects {
 
     const points = new THREE.Points(geometry, material);
     points.frustumCulled = false;
+    points._pooledGeometry = handle.pooled;
+    points._pooledMaterial = false;
     this.scene?.add?.(points);
 
+    const slot = handle.slot;
+    const pooled = handle.pooled;
     const effect = {
       object: points,
       age: 0,
@@ -493,23 +692,21 @@ export class Effects {
         material.size = config.size * (1 + progress * 1.4);
         return progress < 1;
       },
+      onRelease: pooled ? () => _releaseParticleGeometry(slot) : null,
     };
 
     this.effects.push(effect);
   }
 
   _spawnExpandingSphere(position, color, startScale, endScale, ttl) {
-    const geometry = new THREE.SphereGeometry(1, 14, 10);
-    const material = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.6,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
+    // The explosion sphere uses _SPHERE_HI scaled per-frame for the expanding
+    // animation. Opacity fades, so the material comes from the fading pool.
+    const material = _acquireFadingMaterial(color, THREE.AdditiveBlending, 0.6);
+    const mesh = new THREE.Mesh(_SPHERE_HI, material);
     mesh.position.copy(position);
     mesh.scale.setScalar(startScale);
+    mesh._pooledGeometry = true;
+    mesh._pooledMaterial = true;
     this.scene?.add?.(mesh);
 
     const effect = {
