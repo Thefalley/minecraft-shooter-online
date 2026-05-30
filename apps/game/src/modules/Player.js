@@ -16,9 +16,23 @@ const DEFAULTS = {
   maxAmmo: 30,
 };
 
+// Client-Side Prediction ring buffer size. 60 entries @ 20 Hz = 3 seconds of
+// rewindable history, which comfortably covers a worst-case RTT for replay.
+const PREDICTION_BUFFER_SIZE = 60;
+
+// If the local snapshot at snap.seq is within this many world-units of the
+// server's, we blend gently instead of snapping (avoids visible teleports for
+// trivial drift). Beyond this, we hard-snap to the server's values.
+const RECONCILE_SOFT_THRESHOLD = 1.5;
+
+// Per-call blend factor when soft-correcting. ~15% drains a 1u error to
+// imperceptible in ~20 server ticks (~1s @ 20 Hz).
+const RECONCILE_BLEND = 0.15;
+
 const FORWARD = new THREE.Vector3();
 const RIGHT = new THREE.Vector3();
 const MOVE = new THREE.Vector3();
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
 
 function hasInput(input, names) {
   if (!input) return false;
@@ -59,6 +73,17 @@ function readLookDelta(input) {
     x: input.lookX || input.mouseX || input.deltaX || 0,
     y: input.lookY || input.mouseY || input.deltaY || 0,
   };
+}
+
+function readInventorySlot(input) {
+  if (!input) return 0;
+  if (Number.isFinite(input.inventorySlot)) return input.inventorySlot | 0;
+  if (Number.isFinite(input.slot)) return input.slot | 0;
+  // Probe Digit1..Digit9 for a pressed slot key.
+  for (let i = 1; i <= 9; i += 1) {
+    if (hasInput(input, [`Digit${i}`, `${i}`])) return i;
+  }
+  return 0;
 }
 
 function isSolidBlock(world, x, y, z) {
@@ -127,6 +152,42 @@ export class Player {
     this.dashActive = false;
     this.dashRemaining = 0;
     this.dashSpeed = 0;
+
+    // ── Client-Side Prediction state ───────────────────────────────────────
+    //
+    // networkAuthority === 'local' (default): legacy singleplayer path. The
+    // update() loop reads input and drives the player directly.
+    //
+    // networkAuthority === 'server': the network layer pushes the local cmd
+    // into applyInput() and feeds server snapshots into applyServerSnapshot().
+    // update() becomes a no-op so a stray game-loop call can't double-step
+    // the player out of phase with the server.
+    this.networkAuthority = 'local';
+    this._cmdSeq = 0;
+    this._snapBuffer = new Array(PREDICTION_BUFFER_SIZE);
+    this._snapHead = 0;
+    this._recentCmds = new Array(PREDICTION_BUFFER_SIZE);
+    this._cmdHead = 0;
+    this._authorityWarned = new Set();
+  }
+
+  // ── Anti-cheat ───────────────────────────────────────────────────────────
+  //
+  // While networkAuthority === 'server' the local Player is purely a visual
+  // proxy for what the server says. Any caller trying to mutate health/ammo/
+  // position out of band is a bug at best and a cheat path at worst. We
+  // no-op and warn once per method-name so logs stay clean.
+  _denyMutationIfRemote(method) {
+    if (this.networkAuthority !== 'server') return false;
+    if (!this._authorityWarned.has(method)) {
+      this._authorityWarned.add(method);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[Player] ignoring ${method}() while networkAuthority === "server"; ` +
+          'the server is authoritative.',
+      );
+    }
+    return true;
   }
 
   startDash(distance, speed) {
@@ -221,6 +282,7 @@ export class Player {
   }
 
   setPosition(x, y, z) {
+    if (this._denyMutationIfRemote('setPosition')) return this;
     this.cameraHolder.position.set(x, y, z);
     return this;
   }
@@ -235,8 +297,291 @@ export class Player {
     );
   }
 
+  // ── Client-Side Prediction API ─────────────────────────────────────────
+  //
+  // Step 1: decode raw input into a self-contained command object that's
+  // safe to push over the wire AND safe to replay locally after a server
+  // reconciliation. The cmd is what InputPump expects to forward.
+  buildInputCommand(input = {}, deltaSec = 0) {
+    const forward = hasInput(input, ['KeyW', 'w', 'forward', 'moveForward']);
+    const backward = hasInput(input, ['KeyS', 's', 'backward', 'moveBackward']);
+    const left = hasInput(input, ['KeyA', 'a', 'left', 'moveLeft']);
+    const right = hasInput(input, ['KeyD', 'd', 'right', 'moveRight']);
+    const jump = hasInput(input, ['Space', ' ', 'space', 'jump']);
+    const sprint = hasInput(input, ['ShiftLeft', 'ShiftRight', 'shift', 'sprint']);
+    const dash = hasInput(input, ['dash', 'KeyQ', 'q']);
+    const attack = hasInput(input, ['attack', 'fire', 'shoot', 'Mouse0', 'mouse0']);
+    const guard = hasInput(input, ['guard', 'parry', 'Mouse2', 'mouse2']);
+    const reload = hasInput(input, ['reload', 'KeyR', 'r']);
+
+    return {
+      forward,
+      backward,
+      left,
+      right,
+      jump,
+      sprint,
+      dash,
+      attack,
+      guard,
+      reload,
+      // Use the holders' current orientation as-of right now. In the local
+      // path look() has already been applied for this tick, so this captures
+      // the latest yaw/pitch for the server-side replay.
+      rotationY: this.cameraHolder.rotation.y,
+      pitch: this.pitchHolder.rotation.x,
+      inventorySlot: readInventorySlot(input),
+      seq: ++this._cmdSeq,
+      // dt is informational — server uses its own clock. Useful for replay
+      // when no explicit delta is passed.
+      dt: deltaSec,
+    };
+  }
+
+  // Step 2: apply a single decoded command. Pure with respect to (cmd, world)
+  // — same math the legacy singleplayer update() used, just keyed off cmd
+  // fields instead of querying input dictionaries. Used by:
+  //   - the local path (singleplayer) once per frame, and
+  //   - the rewind/replay path after applyServerSnapshot() rolls back state.
+  applyInput(cmd, deltaSec, world = null) {
+    if (!cmd) return;
+    if (!Number.isFinite(deltaSec) || deltaSec <= 0 || !this.isAlive) return;
+
+    // Mid-dash inputs are ignored — the dash plays out under its own logic
+    // and the singleplayer update() already early-returns while dashing.
+    if (this.dashActive) {
+      this.updateDash(deltaSec, world);
+      return;
+    }
+
+    const xAxis = (cmd.right ? 1 : 0) - (cmd.left ? 1 : 0);
+    const zAxis = (cmd.forward ? 1 : 0) - (cmd.backward ? 1 : 0);
+
+    // When the cmd carries an explicit rotationY (network replay), use it so
+    // the replay reproduces the same lateral basis the original tick used.
+    // Otherwise fall back to whatever the cameraHolder currently shows
+    // (matches the legacy local behavior bit-for-bit).
+    const cameraYaw = Number.isFinite(cmd.rotationY)
+      ? cmd.rotationY
+      : this.cameraHolder.rotation.y;
+    const moveYaw = this.movementYaw != null ? this.movementYaw : cameraYaw;
+
+    FORWARD.set(0, 0, -1).applyAxisAngle(Y_AXIS, moveYaw);
+    RIGHT.set(1, 0, 0).applyAxisAngle(Y_AXIS, moveYaw);
+    MOVE.copy(FORWARD).multiplyScalar(zAxis).addScaledVector(RIGHT, xAxis);
+
+    if (MOVE.lengthSq() > 0) {
+      MOVE.normalize();
+      this.lastMoveDir.copy(MOVE);
+    } else {
+      this.lastMoveDir.set(FORWARD.x, 0, FORWARD.z);
+      if (this.lastMoveDir.lengthSq() > 0) this.lastMoveDir.normalize();
+    }
+
+    const speed = this.config.moveSpeed * (cmd.sprint ? this.config.sprintMultiplier : 1);
+    this.velocity.x = MOVE.x * speed;
+    this.velocity.z = MOVE.z * speed;
+
+    if (this.wallJumpCooldown > 0) this.wallJumpCooldown -= deltaSec;
+    if (cmd.jump) {
+      if (this.isGrounded) {
+        this.velocity.y = this.config.jumpSpeed;
+        this.isGrounded = false;
+        this.wallJumpCooldown = 0.35;
+      } else if (this.wallJumpCooldown <= 0 && this.isTouchingWall(world)) {
+        // Wall jump: kick off a wall to climb out of pits/lakes.
+        this.velocity.y = this.config.jumpSpeed;
+        this.wallJumpCooldown = 0.35;
+      }
+    }
+
+    this.velocity.y -= this.config.gravity * deltaSec;
+
+    // Walls taller than one block stop horizontal movement (a single-block
+    // step is allowed and is climbed by the vertical resolve). Per-axis so
+    // you can still slide along a wall.
+    const pos = this.cameraHolder.position;
+    if (this.velocity.x !== 0 && this.isClimbBlocked(world, pos.x + this.velocity.x * deltaSec, pos.z)) {
+      this.velocity.x = 0;
+    }
+    if (this.velocity.z !== 0 && this.isClimbBlocked(world, pos.x, pos.z + this.velocity.z * deltaSec)) {
+      this.velocity.z = 0;
+    }
+
+    pos.addScaledVector(this.velocity, deltaSec);
+
+    this.resolveVerticalCollision(world);
+
+    this.direction.copy(FORWARD);
+  }
+
+  // Step 3: push a post-step transform into the ring so applyServerSnapshot()
+  // can find it again by seq when reconciliation arrives.
+  recordSnapshot(cmd) {
+    if (!cmd || !Number.isFinite(cmd.seq)) return;
+    const pos = this.cameraHolder.position;
+    const entry = {
+      seq: cmd.seq,
+      x: pos.x,
+      y: pos.y,
+      z: pos.z,
+      vx: this.velocity.x,
+      vy: this.velocity.y,
+      vz: this.velocity.z,
+      rotationY: this.cameraHolder.rotation.y,
+      pitch: this.pitchHolder.rotation.x,
+      isGrounded: this.isGrounded,
+      wallJumpCooldown: this.wallJumpCooldown,
+      dashRemaining: this.dashRemaining,
+    };
+    this._snapBuffer[this._snapHead] = entry;
+    this._recentCmds[this._cmdHead] = cmd;
+    this._snapHead = (this._snapHead + 1) % PREDICTION_BUFFER_SIZE;
+    this._cmdHead = (this._cmdHead + 1) % PREDICTION_BUFFER_SIZE;
+  }
+
+  // Step 4: server delivered ground truth for snap.seq. Reconcile by:
+  //   1. Looking up our local prediction at that seq.
+  //   2. If divergence > soft threshold OR we can't find a matching seq,
+  //      hard-snap to the server's transform.
+  //   3. Otherwise gently blend toward the server's transform.
+  //   4. Replay every cmd we issued AFTER snap.seq so the latest local
+  //      transform incorporates the server correction plus the inputs that
+  //      were still in-flight when the snapshot was captured.
+  applyServerSnapshot(snap) {
+    if (!snap || !Number.isFinite(snap.seq)) return;
+
+    const localSnap = this._findSnapshot(snap.seq);
+    const pos = this.cameraHolder.position;
+
+    let divergence = Infinity;
+    if (localSnap) {
+      const dx = pos.x - snap.x;
+      const dy = pos.y - snap.y;
+      const dz = pos.z - snap.z;
+      divergence = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    if (!localSnap || divergence > RECONCILE_SOFT_THRESHOLD) {
+      // Hard snap — we drifted too far, or the server reported a seq we
+      // already evicted from the ring.
+      pos.set(snap.x, snap.y, snap.z);
+      this.velocity.set(snap.vx ?? 0, snap.vy ?? 0, snap.vz ?? 0);
+      if (Number.isFinite(snap.rotationY)) {
+        this.cameraHolder.rotation.y = snap.rotationY;
+      }
+      if (Number.isFinite(snap.pitch)) {
+        this.pitchHolder.rotation.x = snap.pitch;
+      }
+      if (typeof snap.grounded === 'boolean') this.isGrounded = snap.grounded;
+      if (Number.isFinite(snap.wallJumpCooldown)) {
+        this.wallJumpCooldown = snap.wallJumpCooldown;
+      }
+      if (Number.isFinite(snap.dashRemaining)) {
+        this.dashRemaining = snap.dashRemaining;
+        this.dashActive = snap.dashRemaining > 0;
+      }
+    } else {
+      // Soft correction — blend a fraction of the error each call.
+      pos.x += (snap.x - pos.x) * RECONCILE_BLEND;
+      pos.y += (snap.y - pos.y) * RECONCILE_BLEND;
+      pos.z += (snap.z - pos.z) * RECONCILE_BLEND;
+      // Velocity tracks the server exactly so future ticks predict from the
+      // corrected basis; blending velocity adds compounded drift.
+      this.velocity.set(snap.vx ?? this.velocity.x, snap.vy ?? this.velocity.y, snap.vz ?? this.velocity.z);
+      if (typeof snap.grounded === 'boolean') this.isGrounded = snap.grounded;
+      if (Number.isFinite(snap.wallJumpCooldown)) {
+        this.wallJumpCooldown = snap.wallJumpCooldown;
+      }
+      if (Number.isFinite(snap.dashRemaining)) {
+        this.dashRemaining = snap.dashRemaining;
+        this.dashActive = snap.dashRemaining > 0;
+      }
+    }
+
+    // Replay unacked cmds (seq > snap.seq). The ring is small (≤60) so the
+    // worst-case cost is bounded — we don't allocate.
+    const unacked = this._collectUnackedCmds(snap.seq);
+    if (unacked.length === 0) return;
+
+    // We're temporarily rewriting the same snapshot ring while replaying.
+    // Drop the entries we're about to invalidate first so recordSnapshot
+    // overwrites cleanly; replays use the same cmd.seq.
+    for (const cmd of unacked) {
+      const dt = Number.isFinite(cmd.dt) && cmd.dt > 0 ? cmd.dt : 1 / 60;
+      // applyInput touches the same private state (velocity, position) we
+      // just reconciled — exactly what we want.
+      this.applyInput(cmd, dt, snap.world ?? null);
+      this._overwriteSnapshot(cmd);
+    }
+  }
+
+  // Internal: scan ring for the entry matching seq. Returns null if it's
+  // already been evicted (older than 60 ticks behind the head).
+  _findSnapshot(seq) {
+    for (let i = 0; i < PREDICTION_BUFFER_SIZE; i += 1) {
+      const entry = this._snapBuffer[i];
+      if (entry && entry.seq === seq) return entry;
+    }
+    return null;
+  }
+
+  // Internal: collect cmds with seq > ackedSeq in seq-ascending order so
+  // replay applies them oldest-first.
+  _collectUnackedCmds(ackedSeq) {
+    const out = [];
+    for (let i = 0; i < PREDICTION_BUFFER_SIZE; i += 1) {
+      const cmd = this._recentCmds[i];
+      if (cmd && cmd.seq > ackedSeq) out.push(cmd);
+    }
+    out.sort((a, b) => a.seq - b.seq);
+    return out;
+  }
+
+  // Internal: replace the snapshot in the ring matching cmd.seq with the
+  // current transform. Used during replay so subsequent snapshots find the
+  // post-correction values, not the pre-correction predictions.
+  _overwriteSnapshot(cmd) {
+    if (!cmd || !Number.isFinite(cmd.seq)) return;
+    for (let i = 0; i < PREDICTION_BUFFER_SIZE; i += 1) {
+      const entry = this._snapBuffer[i];
+      if (entry && entry.seq === cmd.seq) {
+        const pos = this.cameraHolder.position;
+        entry.x = pos.x;
+        entry.y = pos.y;
+        entry.z = pos.z;
+        entry.vx = this.velocity.x;
+        entry.vy = this.velocity.y;
+        entry.vz = this.velocity.z;
+        entry.rotationY = this.cameraHolder.rotation.y;
+        entry.pitch = this.pitchHolder.rotation.x;
+        entry.isGrounded = this.isGrounded;
+        entry.wallJumpCooldown = this.wallJumpCooldown;
+        entry.dashRemaining = this.dashRemaining;
+        return;
+      }
+    }
+  }
+
+  // Step 5: drop everything. Called on disconnect or when authority flips
+  // back to 'local' so a stale snapshot can't reconcile against future
+  // singleplayer history.
+  clearPrediction() {
+    this._snapBuffer = new Array(PREDICTION_BUFFER_SIZE);
+    this._snapHead = 0;
+    this._recentCmds = new Array(PREDICTION_BUFFER_SIZE);
+    this._cmdHead = 0;
+    this._cmdSeq = 0;
+    this._authorityWarned.clear();
+  }
+
   update(delta, input = {}, world = null) {
     if (!Number.isFinite(delta) || delta <= 0 || !this.isAlive) return;
+
+    // Shield regen runs even when the network is authoritative — except in
+    // that mode the server should be the one healing/draining the shield.
+    // We keep it gated by networkAuthority so 'server' mode is a true no-op.
+    if (this.networkAuthority === 'server') return;
 
     if (this.maxShield > 0 && this.shield < this.maxShield && !this.shieldRegenLocked) {
       this.shield = Math.min(
@@ -253,64 +598,10 @@ export class Player {
       this.look(lookDelta.x, lookDelta.y);
     }
 
-    if (this.dashActive) {
-      this.updateDash(delta, world);
-      return;
-    }
-
-    const xAxis = readAxis(input, ['KeyD', 'd', 'right', 'moveRight'], ['KeyA', 'a', 'left', 'moveLeft']);
-    const zAxis = readAxis(input, ['KeyW', 'w', 'forward', 'moveForward'], ['KeyS', 's', 'backward', 'moveBackward']);
-
-    const moveYaw = this.movementYaw != null ? this.movementYaw : this.cameraHolder.rotation.y;
-    FORWARD.set(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), moveYaw);
-    RIGHT.set(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), moveYaw);
-    MOVE.copy(FORWARD).multiplyScalar(zAxis).addScaledVector(RIGHT, xAxis);
-
-    if (MOVE.lengthSq() > 0) {
-      MOVE.normalize();
-      this.lastMoveDir.copy(MOVE);
-    } else {
-      this.lastMoveDir.set(FORWARD.x, 0, FORWARD.z);
-      if (this.lastMoveDir.lengthSq() > 0) this.lastMoveDir.normalize();
-    }
-
-    const sprinting = hasInput(input, ['ShiftLeft', 'ShiftRight', 'shift', 'sprint']);
-    const speed = this.config.moveSpeed * (sprinting ? this.config.sprintMultiplier : 1);
-    this.velocity.x = MOVE.x * speed;
-    this.velocity.z = MOVE.z * speed;
-
-    if (this.wallJumpCooldown > 0) this.wallJumpCooldown -= delta;
-    const jumpHeld = hasInput(input, ['Space', ' ', 'space', 'jump']);
-    if (jumpHeld) {
-      if (this.isGrounded) {
-        this.velocity.y = this.config.jumpSpeed;
-        this.isGrounded = false;
-        this.wallJumpCooldown = 0.35;
-      } else if (this.wallJumpCooldown <= 0 && this.isTouchingWall(world)) {
-        // Wall jump: kick off a wall to climb out of pits/lakes.
-        this.velocity.y = this.config.jumpSpeed;
-        this.wallJumpCooldown = 0.35;
-      }
-    }
-
-    this.velocity.y -= this.config.gravity * delta;
-
-    // Walls taller than one block stop horizontal movement (a single-block
-    // step is allowed and is climbed by the vertical resolve). Per-axis so you
-    // can still slide along a wall.
-    const pos = this.cameraHolder.position;
-    if (this.velocity.x !== 0 && this.isClimbBlocked(world, pos.x + this.velocity.x * delta, pos.z)) {
-      this.velocity.x = 0;
-    }
-    if (this.velocity.z !== 0 && this.isClimbBlocked(world, pos.x, pos.z + this.velocity.z * delta)) {
-      this.velocity.z = 0;
-    }
-
-    pos.addScaledVector(this.velocity, delta);
-
-    this.resolveVerticalCollision(world);
-
-    this.direction.copy(FORWARD);
+    // Build the cmd AFTER look() so rotationY/pitch reflect this tick's look.
+    const cmd = this.buildInputCommand(input, delta);
+    this.applyInput(cmd, delta, world);
+    this.recordSnapshot(cmd);
   }
 
   resolveVerticalCollision(world) {
@@ -364,6 +655,7 @@ export class Player {
   }
 
   damage(amount) {
+    if (this._denyMutationIfRemote('damage')) return this.health;
     if (this.invulnerable) return this.health;
     let remaining = Math.max(0, amount);
 
@@ -379,6 +671,7 @@ export class Player {
   }
 
   revive() {
+    if (this._denyMutationIfRemote('revive')) return this;
     this.health = this.maxHealth;
     this.shield = this.maxShield;
     this.isAlive = true;
@@ -392,18 +685,21 @@ export class Player {
   }
 
   heal(amount) {
+    if (this._denyMutationIfRemote('heal')) return this.health;
     this.health = Math.min(this.maxHealth, this.health + Math.max(0, amount));
     this.isAlive = this.health > 0;
     return this.health;
   }
 
   consumeAmmo(amount = 1) {
+    if (this._denyMutationIfRemote('consumeAmmo')) return false;
     if (this.ammo < amount) return false;
     this.ammo -= amount;
     return true;
   }
 
   reload(amount = this.maxAmmo) {
+    if (this._denyMutationIfRemote('reload')) return this.ammo;
     this.ammo = THREE.MathUtils.clamp(amount, 0, this.maxAmmo);
     return this.ammo;
   }
