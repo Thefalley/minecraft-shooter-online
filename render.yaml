@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: mvp-server
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: .
+    buildCommand: |
+      corepack enable && corepack prepare pnpm@9.15.0 --activate
+      pnpm install --ignore-scripts
+      pnpm --filter @mvp/server build
+    startCommand: pnpm --filter @mvp/server start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: PORT
+        value: "10000"
