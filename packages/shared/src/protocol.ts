@@ -1,4 +1,4 @@
-import type { ServerErrorCode } from "./types.js";
+import type { ServerErrorCode } from "./types";
 
 export const ClientMessage = {
   Input: "client:input",
