@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
 import {
   PLAYER_NAME_MIN_LENGTH,
   PLAYER_NAME_MAX_LENGTH,
@@ -10,6 +9,7 @@ import {
 } from "@mvp/shared";
 import { useLobbyStore } from "@/stores/lobbyStore";
 import { useTransportSubscription } from "@/hooks/useTransportSubscription";
+import { getTransport } from "@/networking/colyseusTransport";
 
 function validateName(name: string): string | null {
   const trimmed = name.trim();
@@ -34,7 +34,6 @@ function sanitizeCode(raw: string): string {
 
 export function LobbyForm(): JSX.Element {
   useTransportSubscription();
-  const router = useRouter();
 
   const name = useLobbyStore((s) => s.name);
   const setName = useLobbyStore((s) => s.setName);
@@ -43,6 +42,7 @@ export function LobbyForm(): JSX.Element {
   const setError = useLobbyStore((s) => s.setError);
   const createRoom = useLobbyStore((s) => s.createRoom);
   const joinRoomByCode = useLobbyStore((s) => s.joinRoomByCode);
+  const redirectToGame = useLobbyStore((s) => s.redirectToGame);
 
   const [code, setCode] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
@@ -61,11 +61,18 @@ export function LobbyForm(): JSX.Element {
     setError(null);
     try {
       await createRoom(trimmedName);
-      router.push("/play");
+      // Hand off cleanly: drop the lobby's demo connection, then go to the
+      // standalone Voxel-Dragons app where character selection happens.
+      try {
+        await getTransport().leave();
+      } catch {
+        /* ignore — we're leaving the page anyway */
+      }
+      redirectToGame("create");
     } catch {
       // store-level error already populated
     }
-  }, [name, trimmedName, createRoom, router, setError]);
+  }, [name, trimmedName, createRoom, redirectToGame, setError]);
 
   const handleJoin = useCallback(async () => {
     const validation = validateName(name);
@@ -81,18 +88,23 @@ export function LobbyForm(): JSX.Element {
     setError(null);
     try {
       await joinRoomByCode(trimmedName, code);
-      router.push("/play");
+      try {
+        await getTransport().leave();
+      } catch {
+        /* ignore — we're leaving the page anyway */
+      }
+      redirectToGame("join");
     } catch {
       // store-level error already populated
     }
-  }, [name, trimmedName, code, joinRoomByCode, router, setError]);
+  }, [name, trimmedName, code, joinRoomByCode, redirectToGame, setError]);
 
   return (
     <div className="lobby">
       <div>
         <h1>Voxel Shooter MVP</h1>
         <p className="subtitle">
-          Cápsulas, suelo plano y sincronización autoritativa. Crea o únete a una sala.
+          Crea o únete a una sala. Te llevamos al mundo voxel.
         </p>
       </div>
 
