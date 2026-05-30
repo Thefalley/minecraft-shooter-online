@@ -1,8 +1,16 @@
 # Multiplayer Voxel Shooter
 
-Juego web 3D **multiplayer-first**. La propiedad clave es el online: el servidor es autoritativo, el cliente predice localmente para que se sienta instantáneo, y dos jugadores cualesquiera pueden crear/unirse a una sala con un código y verse en tiempo real desde cualquier red.
+Juego web 3D **multiplayer-first**. La propiedad clave es el online: el servidor es autoritativo, el cliente predice localmente para que se sienta instantáneo, y varios jugadores pueden crear/unirse a una sala con un código, elegir personaje en una sala de espera, y jugar Voxel-Dragons juntos en tiempo real desde cualquier red.
 
-**Jugar ya**: 👉 https://minecraft-shooter-online-web.vercel.app
+**Estado actual** (commit `894fd05`):
+
+| Componente | URL | Estado |
+|---|---|---|
+| **Lobby** (Vercel) | https://minecraft-shooter-online-web.vercel.app | ✅ Live — crear/unirse a sala |
+| **Servidor Colyseus** (Render) | https://minecraft-shooter-online.onrender.com | ✅ Live — Phase 2 desplegándose tras último push |
+| **Juego** (Vercel #2) | TBD — pendiente crear proyecto | ⚠️ Build local OK, falta deploy |
+
+> Snapshot exhaustivo del estado de cada fase / tarea / commit en [`docs/STATUS.md`](docs/STATUS.md). Diseñado para sobrevivir compactificaciones de contexto — léelo primero.
 
 > El servidor gratuito de Render se duerme después de 15 minutos sin tráfico. Si nadie está jugando, la primera petición tarda ~30 s en despertarlo. Después va fluido.
 
