@@ -39,9 +39,15 @@ function flattenEnemySnapshot(payload) {
   if (!e || typeof e !== "object") return null;
   const id = payload.id ?? e.id;
   if (id === undefined || id === null) return null;
+  // The dragon schema doesn't carry a `kind` field — the NetworkBridge
+  // injects it at the top of the payload so we accept either source.
+  const kind =
+    (typeof e.kind === "string" && e.kind) ||
+    (typeof payload.kind === "string" && payload.kind) ||
+    null;
   return {
     id,
-    kind: typeof e.kind === "string" ? e.kind : null,
+    kind,
     x: Number.isFinite(e.x) ? e.x : 0,
     y: Number.isFinite(e.y) ? e.y : 0,
     z: Number.isFinite(e.z) ? e.z : 0,

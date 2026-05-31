@@ -206,7 +206,8 @@ export class WitchManager {
 
     if (this._authority === 'server') {
       const now = performance.now();
-      for (const witch of this.witches) {
+      // Bugfix: server entities live in _serverEntities, not in this.witches.
+      for (const witch of this._serverEntities.values()) {
         if (witch.dead || !witch.serverOwned) continue;
         _interpServerEntity(witch, now);
       }

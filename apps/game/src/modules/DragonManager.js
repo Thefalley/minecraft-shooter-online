@@ -505,7 +505,8 @@ export class DragonManager {
     // schema fields and the dragonFireball event pipeline land.)
     if (this._authority === 'server') {
       const now = performance.now();
-      for (const dragon of this.dragons) {
+      // Bugfix: server dragons live in _serverEntities, not in this.dragons.
+      for (const dragon of this._serverEntities.values()) {
         if (dragon.dead || !dragon.serverOwned) continue;
         _interpServerDragon(dragon, now);
       }

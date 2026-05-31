@@ -312,9 +312,12 @@ export class ZombieManager {
 
     // Server-authoritative mode: no AI, no spawning, no attacks. Just
     // interpolate every server-owned visual toward its newest snapshot.
+    // Bugfix: server entities live in _serverEntities (Map), NOT in
+    // this.zombies (which is the local-AI pool, empty in MP). Iterate the
+    // Map values so the interpolation actually runs.
     if (this._authority === 'server') {
       const now = performance.now();
-      for (const zombie of this.zombies) {
+      for (const zombie of this._serverEntities.values()) {
         if (zombie.dead || !zombie.serverOwned) continue;
         _interpServerEntity(zombie, now);
       }

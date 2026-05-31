@@ -187,7 +187,8 @@ export class SkeletonManager {
 
     if (this._authority === 'server') {
       const now = performance.now();
-      for (const skeleton of this.skeletons) {
+      // Bugfix: server entities live in _serverEntities, not in this.skeletons.
+      for (const skeleton of this._serverEntities.values()) {
         if (skeleton.dead || !skeleton.serverOwned) continue;
         _interpServerEntity(skeleton, now);
       }
