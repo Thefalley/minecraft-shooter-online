@@ -250,6 +250,36 @@ export class Game {
           dragons: this.dragons,
         });
         this._enemySync.enable();
+
+        // Wave-event hooks. Singleplayer triggers these inline from
+        // startNextWave(); in multiplayer the server is authoritative so we
+        // listen for the broadcast and react locally (toast + meteor).
+        this._netUnsubs = this._netUnsubs ?? [];
+        const onWaveStart = (p) => {
+          if (!p) return;
+          // Mirror this.wave so the HUD reflects the server's wave.
+          if (Number.isFinite(p.wave)) this.wave = p.wave;
+          // Wave-5 miniboss toast — matches singleplayer copy.
+          if (p.boss === true && this.hud?.showMessage) {
+            this.hud.showMessage('☠ MINIBOSS: Dragón Rojo', 2600);
+          } else if (p.cinematic !== true && Number.isFinite(p.wave) && this.hud?.showMessage) {
+            // Plain wave toast for every non-cinematic wave.
+            this.hud.showMessage(`Oleada ${p.wave}`, 1500);
+          }
+        };
+        const onWaveCinematic = (p) => {
+          if (!p) return;
+          if (p.kind === 'meteor' && typeof this.startMeteorCinematic === 'function') {
+            // Reuse the singleplayer cutscene. It freezes input, plays the
+            // meteor fall + flash + crater, then drops back into 'playing'.
+            // The server has already broadcast the WorldDelta crater so the
+            // local terrain is being carved as the white-out covers it.
+            try { this.startMeteorCinematic({ network: true }); }
+            catch (err) { console.warn('[Game] startMeteorCinematic failed', err); }
+          }
+        };
+        try { this._netUnsubs.push(enemyBridge.on('waveStart', onWaveStart)); } catch { /* ignore */ }
+        try { this._netUnsubs.push(enemyBridge.on('waveCinematic', onWaveCinematic)); } catch { /* ignore */ }
       }
     }
 
@@ -460,10 +490,16 @@ export class Game {
   }
 
   // --- wave-10 meteor cutscene ----------------------------------------------
-  startMeteorCinematic() {
+  //
+  // In SINGLEPLAYER this is called from startNextWave() when wave === 10. In
+  // MULTIPLAYER the server broadcasts a 'waveCinematic' event and the bridge
+  // listener (see constructor) calls this with { network: true } so we know
+  // to defer crater carving and player respawn to the server.
+  startMeteorCinematic(opts = {}) {
     this.state = 'cinematic';
     this.cancelBlasterCharge?.();
     const cfg = BALANCE.meteor;
+    this._meteorNetwork = !!opts.network;
     // The castle sits at the map centre; its gate faces +Z. Park a dedicated
     // cinematic camera outside the gate, looking back at the castle, so the
     // meteor streaks down into frame and explodes on it. Switching the active
@@ -516,6 +552,13 @@ export class Game {
     this.audio.explosion();
     this.hud.whiteout(BALANCE.meteor.flashTime * 1000);
     // Swap the map: the castle becomes a crater (hidden by the white-out).
+    // In multiplayer every client carves locally with the same parameters;
+    // the world geometry is deterministic from the seed so every client ends
+    // up with the same crater. We do NOT route the carve through WorldSync's
+    // emitMineIntent because that would flood the server with thousands of
+    // edits — and the local edits are stamped with `false` in the third
+    // arg of setBlock so WorldSync's patched mutators see only carveCrater's
+    // direct setBlock calls (which bypass the network emitter).
     this.world.carveCrater(0, 0, BALANCE.meteor.craterRadius);
     this.scene.remove(m.mesh);
     m.mesh.geometry.dispose();
@@ -528,6 +571,15 @@ export class Game {
   endMeteorCinematic() {
     this.meteor = null;
     this.activeCamera = this.camera; // back to the first-person view
+    // Multiplayer: the server is authoritative for player position and the
+    // wave roster; do not respawn locally or spawn enemies. We just hand
+    // input back to the player; the next playerSnapshot will reposition us
+    // and EnemySync will populate any enemies the server spawns next.
+    if (this._meteorNetwork) {
+      this._meteorNetwork = false;
+      this.state = 'playing';
+      return;
+    }
     // Drop the player somewhere random on the new cratered map.
     const spawn = this.world.getRandomSpawnPoint();
     this.player.setPosition(spawn.x, spawn.y, spawn.z);
@@ -2003,6 +2055,12 @@ export class Game {
     // a disposed pool.
     try { this._enemySync?.disable?.(); } catch { /* ignore */ }
     try { this._worldSync?.disable?.(); } catch { /* ignore */ }
+    // Drop the bridge waveStart / waveCinematic listeners installed in the
+    // constructor.
+    if (Array.isArray(this._netUnsubs)) {
+      for (const off of this._netUnsubs) { try { off?.(); } catch { /* ignore */ } }
+      this._netUnsubs.length = 0;
+    }
     this._enemySync = null;
     this._worldSync = null;
     if (typeof window !== 'undefined' && window.__voxelGame === this) {

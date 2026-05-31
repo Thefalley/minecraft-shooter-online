@@ -1947,10 +1947,13 @@ export class GameRoom extends Room<GameState> {
       duration: METEOR_BALANCE.duration,
     });
 
-    // Carve the crater. Each affected cell is broadcast as a WorldDelta so
-    // every client converges on the same map state. The math mirrors
-    // World.carveCrater (apps/game/src/engine/World.js).
-    this.carveServerCrater(0, 0, METEOR_BALANCE.craterRadius);
+    // The crater is carved client-side by each player's local World.carveCrater
+    // (called inside Game.meteorImpact). The base terrain is deterministic
+    // from the seed so every client ends up with the same crater geometry —
+    // we do NOT broadcast thousands of WorldDelta messages here. Late joiners
+    // landing AFTER the cinematic will miss the visual but stay consistent
+    // until the next mine/place; Phase 3 (procedural terrain + voxel
+    // collision) will let the server carry an authoritative copy.
 
     console.log(
       `[GameRoom ${this.state.roomCode}] wave=${wave} cinematic=meteor duration=${METEOR_BALANCE.duration}s`,
@@ -1959,43 +1962,6 @@ export class GameRoom extends Room<GameState> {
       wave,
       kind: "meteor",
     });
-  }
-
-  /**
-   * Server-side crater dig. Walks every cell within `radius` and marks it as
-   * removed in the world delta map, broadcasting a WorldDelta for each. The
-   * client's World.carveCrater also rebuilds terrain in a bowl shape; the
-   * server is content with "the column is gone" because the procedural base
-   * (Phase 3) will land later and the dimples are the visual touch.
-   */
-  private carveServerCrater(cx: number, cz: number, radius: number): void {
-    const r2 = radius * radius;
-    for (let dx = -radius; dx <= radius; dx += 1) {
-      for (let dz = -radius; dz <= radius; dz += 1) {
-        if (dx * dx + dz * dz > r2) continue;
-        const x = cx + dx;
-        const z = cz + dz;
-        // Wipe the whole column up to the water level + a little margin so
-        // the crater is visible regardless of what the procedural base laid
-        // down underneath.
-        const top = (this.state.world.waterLevel ?? 6) + 4;
-        for (let y = 0; y <= top; y += 1) {
-          const key = `${x},${y},${z}`;
-          if (this.state.world.deltas.get(key) === 0) continue;
-          this.state.world.deltas.set(key, 0);
-          this.state.world.deltaSeq = (this.state.world.deltaSeq + 1) >>> 0;
-          this.broadcast(VoxelServerMessage.WorldDelta, {
-            op: "mine",
-            x,
-            y,
-            z,
-            t: 0,
-            seq: this.state.world.deltaSeq,
-            by: null,
-          });
-        }
-      }
-    }
   }
 
   /**

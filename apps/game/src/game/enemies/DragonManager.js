@@ -1425,6 +1425,7 @@ export class DragonManager {
     this.dragons.length = 0;
     this._serverEntities.clear();
     this._clearServerFireballs();
+    this._clearServerBossProjectiles();
 
     for (const geometry of Object.values(this.geometry)) {
       geometry.dispose();
