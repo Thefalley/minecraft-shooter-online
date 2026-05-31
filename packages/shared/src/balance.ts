@@ -349,3 +349,37 @@ export const SLASH_BALANCE = {
   zombieSize: 1.6,
   dragonSize: 3.4,
 } as const;
+
+/**
+ * Per-wave enemy rosters used by the server WaveDirector. Append-only so
+ * older clients that don't know about this field keep working. If a wave
+ * index is past the array length, the WaveDirector falls back to its
+ * deterministic scaling formula.
+ *
+ * Counts are total budgets; the WaveDirector also enforces
+ * MAX_ENEMIES_PER_WAVE (30) and MAX_DRAGONS_PER_WAVE (3) caps.
+ */
+export const WAVE_BALANCE = {
+  rosters: [
+    // wave 1 — easy intro
+    { zombies: 3, skeletons: 1, witches: 0, dragons: 0 },
+    // wave 2
+    { zombies: 4, skeletons: 2, witches: 0, dragons: 0 },
+    // wave 3
+    { zombies: 5, skeletons: 2, witches: 1, dragons: 0 },
+    // wave 4 — first dragon
+    { zombies: 5, skeletons: 3, witches: 1, dragons: 1 },
+    // wave 5
+    { zombies: 6, skeletons: 3, witches: 2, dragons: 1 },
+    // wave 6
+    { zombies: 7, skeletons: 4, witches: 2, dragons: 1 },
+    // wave 7 — second dragon
+    { zombies: 8, skeletons: 4, witches: 3, dragons: 2 },
+    // wave 8
+    { zombies: 9, skeletons: 5, witches: 3, dragons: 2 },
+    // wave 9
+    { zombies: 10, skeletons: 5, witches: 4, dragons: 2 },
+    // wave 10 — final
+    { zombies: 12, skeletons: 6, witches: 4, dragons: 3 },
+  ],
+} as const;
