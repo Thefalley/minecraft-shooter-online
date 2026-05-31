@@ -4,6 +4,7 @@ import { SERVER_DEFAULT_PORT, GAME_ROOM_NAME } from "@mvp/shared";
 import cors from "cors";
 import express from "express";
 import http from "node:http";
+import { getDebugLog } from "./debugLog.js";
 import { GameRoom } from "./rooms/GameRoom.js";
 import { isValidRoomCode, normalizeRoomCode } from "./utils/roomCode.js";
 
@@ -24,6 +25,21 @@ gameServer.define(GAME_ROOM_NAME, GameRoom);
 // Health endpoint
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
+});
+
+// Debug endpoint: server's structured event ring for a room. Mirrors the
+// client-side window.__voxelDebug.ring exactly — categories are the same
+// strings (wave:start, enemy:spawn, enemy:despawn, …) so a diagnostic
+// harness can fetch both and line them up by category + payload.id.
+app.get("/debug/rooms/:code/logs", (req, res) => {
+  const raw = req.params.code ?? "";
+  if (!isValidRoomCode(raw)) {
+    res.status(400).json({ error: "INVALID_CODE" });
+    return;
+  }
+  const code = normalizeRoomCode(raw);
+  const events = getDebugLog(code);
+  res.json({ roomCode: code, count: events.length, events });
 });
 
 // Debug endpoint: dump a snapshot of a live room's state by code. Useful

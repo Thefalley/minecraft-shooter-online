@@ -68,6 +68,10 @@ jobs:
         timeout-minutes: 3
         run: node tests/sync-rate.mjs
 
+      - name: Self-check — log equivalence (server ring ≡ client ring)
+        timeout-minutes: 3
+        run: node tests/log-equivalence.mjs
+
       - name: Self-check — UI + game physics (Playwright)
         timeout-minutes: 5
         run: node tests/ui-game-physics.mjs

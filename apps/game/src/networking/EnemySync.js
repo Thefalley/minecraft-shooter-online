@@ -195,6 +195,19 @@ export class EnemySync {
     if (!snap) return;
     const manager = this._managerForKind(snap.kind);
     if (!manager) return;
+    // Only log SPAWNS (first time we see the id), not the high-frequency
+    // position-update path. Otherwise the ring buffer fills with noise.
+    const isSpawn =
+      manager._serverEntities && !manager._serverEntities.has(snap.id);
+    if (isSpawn && typeof window !== "undefined" && window.__voxelDebug) {
+      window.__voxelDebug.push("enemy:spawn", {
+        id: snap.id,
+        kind: snap.kind,
+        x: snap.x,
+        y: snap.y,
+        z: snap.z,
+      });
+    }
     try {
       if (snap.kind === "dragon") {
         if (typeof manager.applyServerDragon === "function") {
@@ -210,8 +223,11 @@ export class EnemySync {
 
   _onEnemyDespawn(payload) {
     if (!payload) return;
-    const id = payload.id ?? payload;
+    const id = payload.id ?? payload.enemyId ?? payload;
     if (id === undefined || id === null) return;
+    if (typeof window !== "undefined" && window.__voxelDebug) {
+      window.__voxelDebug.push("enemy:despawn", { id });
+    }
     // We don't always know the kind on despawn — try every manager that
     // tracks this id. removeServerEnemy returns falsy if it doesn't own it.
     for (const m of [this._zombies, this._skeletons, this._witches, this._dragons]) {

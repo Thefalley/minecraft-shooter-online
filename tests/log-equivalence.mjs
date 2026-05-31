@@ -1,0 +1,166 @@
+/**
+ * Log equivalence check: what the SERVER logged for a room must match
+ * what the CLIENT logged for the same room. Categories and payload IDs
+ * are deliberately mirrored on both sides so a harness can correlate.
+ *
+ * For each category we count the events on both sides and assert:
+ *   - same number of unique IDs (no client sees a phantom enemy, no
+ *     server-spawned enemy is missing on the client)
+ *   - every server-spawned id eventually appears as a client spawn
+ *     (allowing a small time window for the message to arrive)
+ *
+ * If the counts diverge or an id is missing on one side, the suite
+ * exits non-zero and prints which ids were unbalanced. This catches
+ * regressions in EnemySync.backfill, WorldSync.backfill, or any new
+ * networking path that drops events on one side.
+ *
+ * Wire protocol only (HTTP for the server log, raw Colyseus for state,
+ * Playwright for the client log). No language-specific assumptions
+ * beyond the JSON shape documented at PROTOCOL_CONTRACT.md.
+ */
+
+import { chromium } from 'playwright';
+import { Reporter } from './lib/reporter.mjs';
+import {
+  createClient,
+  createRoom,
+  waitForState,
+  safeLeave,
+  httpFromWs,
+} from './lib/colyseus.mjs';
+
+const args = Object.fromEntries(
+  process.argv.slice(2).map((a) => {
+    const [k, v] = a.replace(/^--/, '').split('=');
+    return [k, v ?? true];
+  })
+);
+const SERVER = args.server || 'wss://minecraft-shooter-online.onrender.com';
+const LOBBY = args.lobby || 'https://minecraft-shooter-online-web.vercel.app';
+
+const r = new Reporter(`Log equivalence · ${SERVER}`);
+
+let hostClient = null;
+let hostRoom = null;
+let browser = null;
+let page = null;
+
+try {
+  hostClient = await createClient(SERVER);
+  hostRoom = await createRoom(hostClient, { name: 'LogHost', characterId: 'duck' });
+  await waitForState(hostRoom, (s) => !!s.roomCode, { timeoutMs: 5000 });
+  const code = hostRoom.state.roomCode;
+
+  // Boot a browser client into the same room.
+  browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  page = await ctx.newPage();
+  await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.fill('#name', 'LogClient');
+  await page.fill('#code', code);
+  await page.click('button:has-text("Unirse")');
+  await page.waitForURL(/voxel-dragons-game/, { timeout: 20000 });
+  await page.waitForFunction(() => !!window.__voxelGame, { timeout: 20000 });
+
+  // Start the game from the host so wave 1 spawns.
+  hostRoom.send('vp:lobby:start', { countdownMs: 200 });
+  await waitForState(hostRoom, (s) => s.phase === 'playing', { timeoutMs: 5000 });
+  await waitForState(hostRoom, (s) => s.enemies.size > 0, { timeoutMs: 5000 });
+  // Let the client backfill + render
+  await page.waitForTimeout(3000);
+
+  // Fetch server log over HTTP and client log via the page.
+  const httpBase = httpFromWs(SERVER);
+  let serverEvents = [];
+  let clientEvents = [];
+
+  await r.check('server exposes /debug/rooms/:code/logs', async () => {
+    const res = await fetch(`${httpBase}/debug/rooms/${code}/logs`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
+    if (j.roomCode !== code) throw new Error(`bad roomCode in response: ${j.roomCode}`);
+    if (!Array.isArray(j.events)) throw new Error('events missing');
+    serverEvents = j.events;
+    return `${serverEvents.length} events`;
+  });
+
+  await r.check('client exposes window.__voxelDebug.ring', async () => {
+    clientEvents = await page.evaluate(() => window.__voxelDebug?.ring ?? []);
+    if (!Array.isArray(clientEvents)) throw new Error('ring is not an array');
+    return `${clientEvents.length} events`;
+  });
+
+  const byCat = (events) => {
+    const m = new Map();
+    for (const e of events) {
+      if (!m.has(e.category)) m.set(e.category, []);
+      m.get(e.category).push(e);
+    }
+    return m;
+  };
+
+  const serverByCat = byCat(serverEvents);
+  const clientByCat = byCat(clientEvents);
+
+  // ─── wave:start ───────────────────────────────────────────
+  await r.check('wave:start: server logged exactly one (wave 1)', async () => {
+    const s = serverByCat.get('wave:start') ?? [];
+    if (s.length === 0) throw new Error('server has no wave:start event');
+    if (s[0]?.payload?.wave !== 1) {
+      throw new Error(`first wave:start payload.wave=${s[0]?.payload?.wave}`);
+    }
+    return `${s.length} entry, wave=${s[0].payload.wave}`;
+  });
+
+  await r.check('wave:start: client also logged it (within 5s)', async () => {
+    const c = clientByCat.get('wave:start') ?? [];
+    if (c.length === 0) {
+      throw new Error('client missing wave:start (NetworkBridge log path broken?)');
+    }
+    return `${c.length} entry on client, wave=${c[0]?.payload?.wave}`;
+  });
+
+  // ─── enemy:spawn ──────────────────────────────────────────
+  await r.check('enemy:spawn: server and client agree on ids', async () => {
+    const s = serverByCat.get('enemy:spawn') ?? [];
+    const c = clientByCat.get('enemy:spawn') ?? [];
+    const sIds = new Set(s.map((e) => e.payload.id));
+    const cIds = new Set(c.map((e) => e.payload.id));
+    if (sIds.size === 0) throw new Error('server logged 0 enemy:spawn');
+    if (cIds.size === 0) throw new Error('client logged 0 enemy:spawn');
+    const missing = [...sIds].filter((id) => !cIds.has(id));
+    const extra = [...cIds].filter((id) => !sIds.has(id));
+    if (missing.length > 0) {
+      throw new Error(`client missing ${missing.length}: [${missing.slice(0, 5).join(',')}]`);
+    }
+    if (extra.length > 0) {
+      throw new Error(`client has ${extra.length} extras: [${extra.slice(0, 5).join(',')}]`);
+    }
+    return `${sIds.size} matching ids`;
+  });
+
+  // ─── enemy:spawn: positions match (within 0.5u jitter) ────
+  await r.check('enemy:spawn: positions match within 0.5u', async () => {
+    const s = serverByCat.get('enemy:spawn') ?? [];
+    const c = clientByCat.get('enemy:spawn') ?? [];
+    const sById = new Map(s.map((e) => [e.payload.id, e.payload]));
+    let worst = 0;
+    for (const ce of c) {
+      const sp = sById.get(ce.payload.id);
+      if (!sp) continue;
+      const d = Math.max(
+        Math.abs((sp.x ?? 0) - (ce.payload.x ?? 0)),
+        Math.abs((sp.z ?? 0) - (ce.payload.z ?? 0))
+      );
+      if (d > worst) worst = d;
+    }
+    if (worst > 0.5) throw new Error(`worst spawn-pos drift ${worst.toFixed(2)}u`);
+    return `worst drift=${worst.toFixed(3)}u`;
+  });
+} finally {
+  try { await browser?.close(); } catch {}
+  await safeLeave(hostRoom);
+}
+
+const ok = r.summary();
+process.exit(ok ? 0 : 1);

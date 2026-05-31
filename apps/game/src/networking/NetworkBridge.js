@@ -374,7 +374,15 @@ export class NetworkBridge {
     onMsg(mkey(V, "Damage", "server:damage"), "damage");
     onMsg(mkey(V, "PlayerDeath", "server:player:death"), "playerDeath");
     onMsg(mkey(V, "PlayerRespawn", "server:player:respawn"), "playerRespawn");
-    onMsg(mkey(V, "WaveStart", "server:wave:start"), "waveStart");
+    onMsg(mkey(V, "WaveStart", "server:wave:start"), "waveStart", (p) => {
+      if (typeof window !== "undefined" && window.__voxelDebug) {
+        window.__voxelDebug.push("wave:start", {
+          wave: p?.wave,
+          totalWaves: p?.totalWaves,
+        });
+      }
+      return p;
+    });
     onMsg(mkey(V, "WaveEnd", "server:wave:end"), "waveEnd");
     onMsg(mkey(V, "ShopOpen", "server:shop:open"), "shopOpen");
     onMsg(mkey(V, "ShopClose", "server:shop:close"), "shopClose");

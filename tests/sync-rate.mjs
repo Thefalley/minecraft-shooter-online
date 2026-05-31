@@ -48,18 +48,9 @@ try {
   probeRoom = await joinByCode(probeClient, code, { name: 'SProbe', characterId: 'mage' });
   await waitForState(hostRoom, (s) => s.players.size === 2, { timeoutMs: 5000 });
 
-  // Browser probe joins via the lobby URL flow (same path users take).
-  browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  page = await ctx.newPage();
-  await page.goto(`${LOBBY}/?join=1&code=${code}&name=SBrowser`, { waitUntil: 'networkidle' });
-  // Lobby UI for joining might differ; bail to direct game URL with code:
-  // The lobby's join path posts to the game via URL params. If the browser
-  // ended up still on the lobby, fall through — we will instead start the
-  // game from the raw host.
-  await page.waitForTimeout(2500);
-
-  // Now host starts the game so enemies spawn.
+  // Host starts the game so enemies spawn — do this BEFORE the browser
+  // probe joins, because Vercel's wake-up first request can take 10-20s
+  // and we want the enemies already in state for the probe to observe.
   hostRoom.send('vp:lobby:start', { countdownMs: 200 });
   await waitForState(hostRoom, (s) => s.phase === 'playing', { timeoutMs: 5000 });
   await waitForState(hostRoom, (s) => s.enemies.size > 0, { timeoutMs: 5000 });
@@ -112,22 +103,22 @@ try {
   });
 
   // ─── Browser-side render rate ──────────────────────────────
-  // Open the game in the same room as a fresh client and check the
-  // rendered mesh updates over time.
+  // Boot a Chromium client through the real lobby form (fill name +
+  // code, click Unirse) so we observe what an actual player sees.
+  browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  page = await ctx.newPage();
+
   await r.check('browser client renders enemy motion at ≥3Hz', async () => {
-    // Get to a game scene. Use lobby flow if not already there.
-    const url = page.url();
-    if (!url.includes('voxel-dragons-game')) {
-      await page.goto(`${LOBBY}/?join=1&code=${code}&name=SBrowserB`, {
-        waitUntil: 'networkidle',
-      });
-      // Click join button if present.
-      try { await page.click('button:has-text("Unirse")', { timeout: 3000 }); } catch {}
-      await page.waitForURL(/voxel-dragons-game/, { timeout: 10000 });
-    }
-    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 15000 });
-    await page.waitForTimeout(3000);
-    // Sample the mesh position of the tracked zombie every 100ms for 3s.
+    await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.fill('#name', 'SBrowser');
+    await page.fill('#code', code);
+    await page.click('button:has-text("Unirse")');
+    await page.waitForURL(/voxel-dragons-game/, { timeout: 20000 });
+    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 20000 });
+    // EnemySync needs a beat to backfill + WorldSync regenerates terrain.
+    await page.waitForTimeout(4000);
+
     const samples = await page.evaluate(async (id) => {
       const out = [];
       for (let i = 0; i < 30; i += 1) {
@@ -140,12 +131,37 @@ try {
       }
       return out;
     }, trackedId);
-    if (samples.length < 10) {
-      return `browser took ${samples.length} samples (joined too late, soft pass)`;
+
+    if (samples.length === 0) {
+      // The tracked id may have despawned (server killed it). Pick any
+      // remaining enemy and resample. Soft-fail if still nothing.
+      const fallback = await page.evaluate(async () => {
+        const g = window.__voxelGame;
+        if (!g?.zombies?._serverEntities) return [];
+        const ids = [...g.zombies._serverEntities.keys()];
+        if (ids.length === 0) return [];
+        const fid = ids[0];
+        const out = [];
+        for (let i = 0; i < 30; i += 1) {
+          const e = g.zombies._serverEntities.get(fid);
+          if (e?.mesh) out.push({ t: i * 100, x: e.mesh.position.x, z: e.mesh.position.z });
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return out;
+      });
+      if (fallback.length < 10) {
+        return `no trackable zombie on browser client (${fallback.length} samples)`;
+      }
+      const distinct = new Set(fallback.map((s) => `${s.x.toFixed(2)},${s.z.toFixed(2)}`)).size;
+      if (distinct < 5) {
+        throw new Error(`fallback zombie only ${distinct} distinct positions / 30 samples`);
+      }
+      return `${distinct} distinct positions (fallback id)`;
     }
+
     const distinct = new Set(samples.map((s) => `${s.x.toFixed(2)},${s.z.toFixed(2)}`)).size;
     if (distinct < 5) {
-      throw new Error(`browser mesh saw only ${distinct} distinct positions / 30 samples`);
+      throw new Error(`browser mesh only ${distinct} distinct positions / 30 samples`);
     }
     return `${distinct} distinct positions in 3s on browser mesh`;
   });

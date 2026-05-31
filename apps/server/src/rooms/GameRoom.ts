@@ -25,6 +25,7 @@ import {
   WORLD_WATER_LEVEL,
   WORLD_WIDTH,
 } from "@mvp/shared";
+import { debugLog, clearDebugLog } from "../debugLog.js";
 import { FireballState } from "../schema/FireballState.js";
 import { GameState } from "../schema/GameState.js";
 import { VoxelPlayer } from "../schema/VoxelPlayer.js";
@@ -328,6 +329,7 @@ export class GameRoom extends Room<GameState> {
 
   onDispose(): void {
     console.log(`[GameRoom ${this.state.roomCode}] disposed`);
+    clearDebugLog(this.state.roomCode);
   }
 
   // -------------------------------------------------------------------------
@@ -1057,6 +1059,20 @@ export class GameRoom extends Room<GameState> {
     console.log(
       `[GameRoom ${this.state.roomCode}] wave=${wave} spawned enemies=${ids.enemies.length} dragons=${ids.dragons.length}`,
     );
+    debugLog(this.state.roomCode, "wave:start", {
+      wave,
+      enemies: ids.enemies.length,
+      dragons: ids.dragons.length,
+    });
+    for (const snap of snapshots) {
+      debugLog(this.state.roomCode, "enemy:spawn", {
+        id: snap.id,
+        kind: snap.kind,
+        x: snap.x,
+        y: snap.y,
+        z: snap.z,
+      });
+    }
   }
 
   /**
@@ -1108,6 +1124,7 @@ export class GameRoom extends Room<GameState> {
     // Killed.
     this.state.enemies.delete(id);
     this.broadcast(VoxelServerMessage.EnemyDespawn, { enemyId: id });
+    debugLog(this.state.roomCode, "enemy:despawn", { id, reason: "killed", by: attackerSessionId ?? null });
     this.awardCoins(attackerSessionId, coinsForKind(e.kind));
     return true;
   }
