@@ -45,20 +45,31 @@ let botClient = null;
 let botRoom = null;
 let roomCode = null;
 
-// Warm-up: hit /health a few times so Render's free-tier instance is awake
-// before the actual test clock starts. Render takes 10-30 s to wake from
-// sleep and that latency was the cause of CI flakes.
+// Warm-up: hit /health repeatedly so Render's free-tier instance is awake
+// AND the most recently pushed deploy has booted. CI runs on every push
+// and Render redeploys in parallel — the test can start while the server
+// is still building. 12 retries × ~8 s = up to ~100 s of grace.
 try {
   const httpBase = SERVER.replace(/^ws/, 'http');
-  for (let i = 0; i < 6; i += 1) {
+  let lastUptime = -1;
+  for (let i = 0; i < 12; i += 1) {
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
+      const t = setTimeout(() => ctrl.abort(), 6000);
       const res = await fetch(`${httpBase}/health`, { signal: ctrl.signal });
       clearTimeout(t);
-      if (res.ok) break;
+      if (res.ok) {
+        const j = await res.json().catch(() => null);
+        const uptime = j?.uptime ?? 0;
+        // Wait until uptime > 15 s — that's when the new code has finished
+        // bootstrapping (the deploy event resets uptime to 0).
+        if (uptime > 15) break;
+        // If uptime is increasing each retry we are watching the same
+        // deploy come up; keep going.
+        lastUptime = uptime;
+      }
     } catch { /* ignore + retry */ }
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, 6000));
   }
 } catch { /* warm-up best-effort */ }
 
