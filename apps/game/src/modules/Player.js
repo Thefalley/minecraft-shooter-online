@@ -578,9 +578,20 @@ export class Player {
   update(delta, input = {}, world = null) {
     if (!Number.isFinite(delta) || delta <= 0 || !this.isAlive) return;
 
-    // Shield regen runs even when the network is authoritative — except in
-    // that mode the server should be the one healing/draining the shield.
-    // We keep it gated by networkAuthority so 'server' mode is a true no-op.
+    // Mouse-look runs ALWAYS, even under networkAuthority === 'server'.
+    // Rotating the camera is presentation-only and the local player needs
+    // to be able to aim regardless of who owns movement. Without this,
+    // multiplayer made the camera frozen because the early-return below
+    // bypassed look() too.
+    const lookLocked = this.movementYaw != null;
+    const lookDelta = readLookDelta(input);
+    if (!lookLocked && (lookDelta.x || lookDelta.y)) {
+      this.look(lookDelta.x, lookDelta.y);
+    }
+
+    // Server-authoritative mode: Game.js drives buildInputCommand / applyInput
+    // / recordSnapshot directly so the CSP path runs there. Nothing else to do
+    // here besides the look() that already happened above.
     if (this.networkAuthority === 'server') return;
 
     if (this.maxShield > 0 && this.shield < this.maxShield && !this.shieldRegenLocked) {
@@ -588,14 +599,6 @@ export class Player {
         this.maxShield,
         this.shield + this.maxShield * (this.shieldRegenPercent / 100) * delta,
       );
-    }
-
-    // While the movement basis is overridden (e.g. the hunter top-down view)
-    // mouse-look is ignored so the screen-aligned directions stay stable.
-    const lookLocked = this.movementYaw != null;
-    const lookDelta = readLookDelta(input);
-    if (!lookLocked && (lookDelta.x || lookDelta.y)) {
-      this.look(lookDelta.x, lookDelta.y);
     }
 
     // Build the cmd AFTER look() so rotationY/pitch reflect this tick's look.
