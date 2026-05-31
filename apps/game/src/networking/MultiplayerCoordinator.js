@@ -26,10 +26,11 @@ import { RemotePlayerRegistry } from "./RemotePlayerRegistry.js";
 
 /**
  * Defensive flattener for snapshot payloads. The bridge currently emits
- * `playerSnapshot` from two places:
- *   - state-callbacks path:    { sessionId, player }           (schema proxy)
- *   - VoxelServerMessage path: { sessionId, x, y, z, ... }     (already flat)
- * We accept either and return a plain object the registry can consume.
+ * `playerSnapshot` from three places:
+ *   - state-callbacks path (post-fix):   flat { sessionId, characterId, x, ... }
+ *   - state-callbacks path (legacy):     { sessionId, player } (schema proxy)
+ *   - VoxelServerMessage path:           { sessionId, x, y, z, ... } (flat)
+ * We accept any of them and return a plain object the registry can consume.
  */
 function flattenSnapshot(snap) {
   if (!snap || typeof snap !== "object") return null;
@@ -39,6 +40,7 @@ function flattenSnapshot(snap) {
   return {
     sessionId,
     name: src.name,
+    characterId: src.characterId,
     x: src.x,
     y: src.y,
     z: src.z,
@@ -69,7 +71,38 @@ export class MultiplayerCoordinator {
       selfSessionIdProvider: () => this._selfSessionId,
     });
     if (game.player) game.player.networkAuthority = "server";
+
+    // Seed self id from the bridge BEFORE wiring listeners. Welcome arrived
+    // during the WaitingRoom phase, long before _wireBridge was subscribed,
+    // so the 'welcome' event would otherwise never replay self id here.
+    const seededSelfId = this._bridge.getSelfSessionId?.() ?? null;
+    if (seededSelfId) this._selfSessionId = seededSelfId;
+
     this._wireBridge();
+
+    // Replay every player already in the schema. By the time bind() runs the
+    // server's onAdd has fired (and been swallowed because nobody was
+    // subscribed to playerSnapshot yet). Without this replay, remote players
+    // only ever appear once they move (when the per-player onChange fires).
+    this._seedExistingPlayers();
+  }
+
+  /**
+   * Walk room.state.players once and synthesise a playerSnapshot for each.
+   * Used by {@link bind} to catch up state that's already been delivered to
+   * the bridge before the registry existed.
+   */
+  _seedExistingPlayers() {
+    if (!this._registry) return;
+    const state = this._bridge.getRoomState?.();
+    const players = state?.players;
+    if (!players || typeof players.forEach !== "function") return;
+    players.forEach((player, sessionId) => {
+      const snap = flattenSnapshot({ sessionId, player });
+      if (!snap) return;
+      if (snap.sessionId === this._selfSessionId) return;
+      this._registry.onSnapshot(snap);
+    });
   }
 
   /** Should be called from Game.tick(now) before render, after sim. */
@@ -113,7 +146,12 @@ export class MultiplayerCoordinator {
     const off = (event, fn) => this._listeners.push(b.on(event, fn));
 
     off("welcome", (p) => {
-      this._selfSessionId = p?.selfSessionId ?? null;
+      const nextId = p?.selfSessionId ?? null;
+      this._selfSessionId = nextId;
+      // Race guard: if a snapshot arrived BEFORE welcome resolved the self id,
+      // the registry would have spawned a remote mesh for our own session.
+      // Tear it down now that we know who "we" are.
+      if (nextId) this._registry?.remove(nextId);
     });
 
     off("playerJoined", (_p) => {

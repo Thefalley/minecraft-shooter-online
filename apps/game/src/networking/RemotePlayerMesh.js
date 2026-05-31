@@ -23,6 +23,25 @@ import { SNAPSHOT_INTERPOLATION_DELAY_MS } from "@mvp/shared";
 const BUFFER_SIZE = 24;
 const DEFAULT_DELAY_MS = 120;
 
+// Per-character body tint so remotes are recognisable at a glance. Mirrors
+// the lobby's CharacterSelectStrip palette (loosely). Unknown ids fall back
+// to a neutral red so we never throw.
+const CHARACTER_COLORS = Object.freeze({
+  duck: 0xffd34d,     // yellow / orange
+  knight: 0x4a8fff,   // blue
+  hunter: 0x4caf50,   // green
+  samurai: 0xef5b5b,  // red
+  mage: 0xb16cea,     // purple
+});
+const DEFAULT_BODY_COLOR = 0xef5b5b;
+const DEAD_BODY_COLOR = 0x5a2a31;
+
+function colorForCharacter(characterId) {
+  if (!characterId) return DEFAULT_BODY_COLOR;
+  const hex = CHARACTER_COLORS[characterId];
+  return typeof hex === "number" ? hex : DEFAULT_BODY_COLOR;
+}
+
 function shortAngleDelta(from, to) {
   let d = to - from;
   while (d > Math.PI) d -= 2 * Math.PI;
@@ -36,8 +55,9 @@ function makeLabelTexture(name) {
   canvas.height = 64;
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // Background pill
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  // Background pill — bumped to a near-opaque black so the white text stays
+  // crisp even when the player is in front of a bright voxel texture.
+  ctx.fillStyle = "rgba(0,0,0,0.82)";
   const pad = 8;
   const r = 18;
   const x = pad;
@@ -56,6 +76,10 @@ function makeLabelTexture(name) {
   ctx.quadraticCurveTo(x, y, x + r, y);
   ctx.closePath();
   ctx.fill();
+  // Thin white outline for extra contrast on noisy backgrounds.
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255,0.65)";
+  ctx.stroke();
   // Text
   ctx.font = "bold 28px system-ui, -apple-system, Segoe UI, sans-serif";
   ctx.fillStyle = "#ffffff";
@@ -72,11 +96,12 @@ function makeLabelTexture(name) {
 
 export class RemotePlayerMesh {
   /**
-   * @param {{sessionId: string, name: string, scene: THREE.Scene}} opts
+   * @param {{sessionId: string, name: string, characterId?: string|null, scene: THREE.Scene}} opts
    */
-  constructor({ sessionId, name, scene }) {
+  constructor({ sessionId, name, characterId, scene }) {
     this.sessionId = sessionId;
     this._name = name || sessionId;
+    this._characterId = typeof characterId === "string" ? characterId : null;
     this._scene = scene;
     this._buffer = [];
     this._delayMs = SNAPSHOT_INTERPOLATION_DELAY_MS || DEFAULT_DELAY_MS;
@@ -90,7 +115,7 @@ export class RemotePlayerMesh {
     // Body: capsule (radius 0.4, length 1.2 between hemispheres).
     const bodyGeom = new THREE.CapsuleGeometry(0.4, 1.2, 8, 16);
     this._bodyMaterial = new THREE.MeshStandardMaterial({
-      color: 0xef5b5b,
+      color: colorForCharacter(this._characterId),
       roughness: 0.85,
       metalness: 0.0,
     });
@@ -100,16 +125,22 @@ export class RemotePlayerMesh {
     this._bodyMesh.position.y = 1.0; // half height so the capsule stands on y=0
     this.group.add(this._bodyMesh);
 
-    // Name label as a sprite.
+    // Name label as a sprite. depthTest=false + renderOrder=10 means the
+    // pill stays readable even when the player is behind a voxel column —
+    // very useful when scouting an enemy through a wall in the lobby.
     this._labelTexture = makeLabelTexture(this._name);
     this._labelMaterial = new THREE.SpriteMaterial({
       map: this._labelTexture,
       depthTest: false,
+      depthWrite: false,
       transparent: true,
     });
     this._labelSprite = new THREE.Sprite(this._labelMaterial);
     this._labelSprite.scale.set(1.6, 0.4, 1);
-    this._labelSprite.position.y = 2.4;
+    // Top of the capsule body sits at body-local y = 2.0 (1.0 mesh offset +
+    // 1.0 half-height). 2.6 keeps a comfortable gap above the head.
+    this._labelSprite.position.y = 2.6;
+    this._labelSprite.renderOrder = 10;
     this.group.add(this._labelSprite);
 
     scene.add(this.group);
@@ -198,20 +229,36 @@ export class RemotePlayerMesh {
   /**
    * Hook for the HP bar. We just stash the numbers and tint the body when
    * dead; the actual bar UI is in HUD-land and will read these later.
+   * "Alive" recolours back to the per-character tint, not a hard-coded red.
    */
   setHealth(hp, maxHp) {
     if (this._disposed) return;
     this._hp = Math.max(0, Number(hp) || 0);
     this._maxHp = Math.max(1, Number(maxHp) || this._maxHp);
     if (this._hp <= 0) {
-      this._bodyMaterial.color.setHex(0x5a2a31);
+      this._bodyMaterial.color.setHex(DEAD_BODY_COLOR);
     } else {
-      this._bodyMaterial.color.setHex(0xef5b5b);
+      this._bodyMaterial.color.setHex(colorForCharacter(this._characterId));
     }
   }
 
   getHealth() {
     return { hp: this._hp, maxHp: this._maxHp };
+  }
+
+  /**
+   * Late-arriving character pick from the server. We swap the body tint to
+   * the matching colour unless the player is currently flagged dead — they
+   * keep the desaturated dead colour until they respawn.
+   */
+  setCharacter(characterId) {
+    if (this._disposed) return;
+    if (typeof characterId !== "string" || !characterId) return;
+    if (characterId === this._characterId) return;
+    this._characterId = characterId;
+    if (this._hp > 0) {
+      this._bodyMaterial.color.setHex(colorForCharacter(this._characterId));
+    }
   }
 
   dispose() {
