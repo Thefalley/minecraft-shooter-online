@@ -1,10 +1,10 @@
 # Estado del repo — 2026-05-31
 
-⚠️ **Esta build NO es estable**. CI no está pasando todavía.
+✅ **Build estable.** CI 100% verde en commit `9be2603`.
 
-## Última CI ejecutada
+## Última CI
 
-Commit `7e23eee`, run https://github.com/Thefalley/minecraft-shooter-online/actions/runs/26718445705
+Run https://github.com/Thefalley/minecraft-shooter-online/actions/runs/26718959254
 
 | Step | Resultado |
 |---|---|
@@ -12,48 +12,50 @@ Commit `7e23eee`, run https://github.com/Thefalley/minecraft-shooter-online/acti
 | Build | ✅ |
 | `server-multiplayer` (16 checks) | ✅ |
 | `behavior-multiplayer` (7 checks) | ✅ |
-| `sync-rate` (3 checks) | ✗ **falla en CI** |
-| `log-equivalence` | ◌ skipped (porque la anterior falló) |
-| `ui-game-physics` | ◌ skipped |
+| `sync-rate` (3 checks) | ✅ |
+| `log-equivalence` (6 checks) | ✅ |
+| `ui-game-physics` (14 checks) | ✅ |
 
-## Qué funciona
+## Qué funciona en producción ahora mismo
 
-- Lobby + waiting room
-- Hosting + join por código
-- Server-authoritative: enemigos spawneados y moviéndose por el server
-- Mismos zombies/posiciones en cada cliente (raw Colyseus)
+- Lobby + waiting room (5 character cards, host start countdown)
+- Crear/unirse a sala por código de 5 chars
+- Server-authoritative: zombies, esqueletos, brujas, dragones movidos por el server
+- Mismas posiciones de enemigos en cada cliente (drift inter-cliente <0.2u)
+- Zombies persiguen al player más cercano
 - Late joiner sincroniza state.world + state.enemies
-- Player movement broadcast
+- Player movement broadcast a otros clientes
 - World delta sync (mining → todos lo ven)
-- Logs equivalentes server↔cliente vía
-  - `GET /debug/rooms/<CODE>/logs` (server)
-  - `window.__voxelDebug.dump()` (cliente)
+- Logs equivalentes server↔cliente:
+  - `GET /debug/rooms/<CODE>/logs` (server) → JSON con wave:start, enemy:spawn, enemy:despawn
+  - `window.__voxelDebug.dump()` (cliente) → mismo schema
+- Suite integrada Voxel-Dragons `feature/weapon-feel-pack`:
+  - Modos Waves / Campaign (Campaign para Pato con headshot bonus)
+  - Mapas múltiples (meadow, snowland, Minecraft NBT importer)
+  - Wave 5 dragón rojo miniboss
+  - Wave 10 cinemática meteorito
+  - Weapon-feel: recoil, swing, samurai technique, blaster charge
+  - Threat marker, steering AI, water avoidance
+  - Collision radius-aware + step-up
+  - Profiler in-browser
 
-## Qué no funciona o no está claro
+## Qué no está terminado todavía
 
-- **`sync-rate.mjs` falla en CI**, pasa local. Probable causa: Vercel cold-start lento en Linux CI excede el timeout del Playwright probe.
-- **Combate sincronizado**: client raycast funciona local pero el server no recibe `WeaponFire` intent → matar un zombie no se propaga.
-- **Wave progression**: solo wave 1 verificada, las siguientes 2-10 sin probar end-to-end.
-- **Dragones**: 0 spawn en wave 1 (por diseño del roster). Wave 4+ no testeado.
-- **Stress test 8 jugadores reales**: validado en `tests/stress-8-players-visual.mjs` solo a nivel de raw Colyseus, no UI.
-
-## Bugs confirmados pendientes
-
-Ninguno conocido actualmente — la última tanda (b58377e → 053ec4c → 60fa9f0 → 82d0b1e → 892b49b → 7e23eee) cubrió:
-- Iterator wrong-collection en 4 managers
-- Backfill de enemigos/dragones en EnemySync
-- Backfill de worldSeed en WorldSync
-- Local `startNextWave` doble-spawn en multiplayer
-- Player spawn Y mismatch entre client y server
-- CI `echo (...)` parseado como subshell en bash
+- ⏳ **Combate sincronizado** (Phase 5): el client ya lanza el raycast y el server tiene `applyDamage`, pero falta el `WeaponFire` intent + lag compensation. Por eso disparar a un zombie no se propaga como kill.
+- ⏳ **Shop entre oleadas en MP**: existe en singleplayer (campaign + waves), falta cablear el flujo de moneda persistente entre rondas en MP.
+- ⏳ **Selección de mapa desde el lobby**: MP usa `MAPS[0]` (meadow) por defecto. Falta UI en el lobby para elegir.
+- ⏳ **Selección de modo (campaign vs waves) desde el lobby**: MP fuerza `waves`. Falta UI para campaign.
 
 ## URLs en producción
 
-- Jugar: https://minecraft-shooter-online-web.vercel.app
-- Repo: https://github.com/Thefalley/minecraft-shooter-online
-- Server: https://minecraft-shooter-online.onrender.com
-- Health: https://minecraft-shooter-online.onrender.com/health
+- 🎮 Jugar: https://minecraft-shooter-online-web.vercel.app
+- 📦 Repo: https://github.com/Thefalley/minecraft-shooter-online
+- 🚀 Server: https://minecraft-shooter-online.onrender.com
+- 🩺 Health: https://minecraft-shooter-online.onrender.com/health
+- 📊 Logs (sustituye CODE): https://minecraft-shooter-online.onrender.com/debug/rooms/CODE/logs
 
-## Lo siguiente
+## Documentación
 
-El usuario va a indicar un nuevo repo a clonar y probablemente moveremos el trabajo allí.
+- README.md — vista general del stack y deploy
+- tests/PROTOCOL_CONTRACT.md — contrato WebSocket del server para tests multi-lenguaje
+- memory/feedback_self_check.md — protocolo de self-check antes de declarar un fix completo
