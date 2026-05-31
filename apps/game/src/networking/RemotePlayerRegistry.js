@@ -26,7 +26,18 @@ export class RemotePlayerRegistry {
    * Called from the coordinator on every snapshot the server pushes.
    * Filters out self snapshots; everyone else gets upserted.
    */
-  onSnapshot({ sessionId, name, x, y, z, rotationY, health, maxHealth, connected }) {
+  onSnapshot({
+    sessionId,
+    name,
+    characterId,
+    x,
+    y,
+    z,
+    rotationY,
+    health,
+    maxHealth,
+    connected,
+  }) {
     if (!sessionId) return;
     if (sessionId === this._selfIdProvider()) return;
 
@@ -35,6 +46,7 @@ export class RemotePlayerRegistry {
       mesh = new RemotePlayerMesh({
         sessionId,
         name: name || "Player",
+        characterId: typeof characterId === "string" ? characterId : null,
         scene: this._scene,
       });
       this._remotes.set(sessionId, mesh);
@@ -42,6 +54,9 @@ export class RemotePlayerRegistry {
 
     mesh.pushSnapshot({ x, y, z, rotationY });
     if (typeof name === "string" && name) mesh.setName(name);
+    if (typeof characterId === "string" && characterId) {
+      mesh.setCharacter(characterId);
+    }
     if (typeof health === "number" && typeof maxHealth === "number") {
       mesh.setHealth(health, maxHealth);
     }

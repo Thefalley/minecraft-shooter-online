@@ -424,14 +424,32 @@ export class NetworkBridge {
     if (!state) return;
 
     // Players ────────────────────────────────────────────────────────────
+    //
+    // We re-emit a FLAT snapshot (with characterId) on every onAdd and on
+    // every per-player onChange. The flat shape lets the coordinator skip
+    // re-flattening hot-path payloads, but flattenSnapshot still accepts the
+    // legacy {sessionId, player} envelope for backward-compat with any other
+    // subscriber.
     try {
       const players$ = $(state).players;
       if (players$ && typeof players$.onAdd === "function") {
+        const snap = (sessionId, player) => ({
+          sessionId,
+          name: player?.name,
+          characterId: player?.characterId,
+          x: player?.x,
+          y: player?.y,
+          z: player?.z,
+          rotationY: player?.rotationY,
+          health: player?.health,
+          maxHealth: player?.maxHealth,
+          connected: player?.connected,
+        });
         players$.onAdd((player, sessionId) => {
-          this._emit("playerSnapshot", { sessionId, player });
+          this._emit("playerSnapshot", snap(sessionId, player));
           try {
             $(player).onChange(() => {
-              this._emit("playerSnapshot", { sessionId, player });
+              this._emit("playerSnapshot", snap(sessionId, player));
             });
           } catch {
             /* schema-callbacks proxy may reject — non-fatal */
