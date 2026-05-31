@@ -2,6 +2,59 @@ import * as THREE from 'three';
 
 const DEFAULT_BOUNDS = { minX: -22, maxX: 22, minZ: -22, maxZ: 22 };
 
+// Snapshot interpolation tuning for server-driven entities (multiplayer).
+const SERVER_SNAPSHOT_BUFFER = 8;
+const SERVER_INTERP_DELAY_MS = 120;
+
+function _pushServerSnap(buffer, snap) {
+  const now = performance.now();
+  const last = buffer[buffer.length - 1];
+  if (last && last.t >= now) return;
+  buffer.push({
+    t: now,
+    x: Number.isFinite(snap.x) ? snap.x : 0,
+    y: Number.isFinite(snap.y) ? snap.y : 0,
+    z: Number.isFinite(snap.z) ? snap.z : 0,
+    rotationY: Number.isFinite(snap.rotationY) ? snap.rotationY : 0,
+  });
+  if (buffer.length > SERVER_SNAPSHOT_BUFFER) buffer.shift();
+}
+
+function _shortAngleDelta(from, to) {
+  let d = to - from;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+function _interpServerEntity(entity, now) {
+  const buf = entity._buffer;
+  if (!buf || buf.length === 0) return;
+  const renderT = now - SERVER_INTERP_DELAY_MS;
+  const pos = entity.mesh.position;
+  if (renderT <= buf[0].t) {
+    pos.set(buf[0].x, buf[0].y, buf[0].z);
+    entity.mesh.rotation.y = buf[0].rotationY;
+    return;
+  }
+  const newest = buf[buf.length - 1];
+  if (renderT >= newest.t) {
+    pos.set(newest.x, newest.y, newest.z);
+    entity.mesh.rotation.y = newest.rotationY;
+    return;
+  }
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t > renderT) i--;
+  const a = buf[i];
+  const b = buf[i + 1];
+  const span = b.t - a.t;
+  const alpha = span > 0 ? (renderT - a.t) / span : 0;
+  pos.x = a.x + (b.x - a.x) * alpha;
+  pos.y = a.y + (b.y - a.y) * alpha;
+  pos.z = a.z + (b.z - a.z) * alpha;
+  entity.mesh.rotation.y = a.rotationY + _shortAngleDelta(a.rotationY, b.rotationY) * alpha;
+}
+
 function getWorldPosition(target, fallback = new THREE.Vector3()) {
   if (!target) return fallback.set(0, 0, 0);
   if (target.isVector3) return fallback.copy(target);
@@ -47,6 +100,11 @@ export class WitchManager {
     this.tmpPlayer = new THREE.Vector3();
     this.tmpDir = new THREE.Vector3();
     this.tmpRaycaster = new THREE.Raycaster();
+
+    // Multiplayer: 'server' disables local AI/spawn/potions and switches
+    // update() to pure snapshot interpolation. Default 'local'.
+    this._authority = 'local';
+    this._serverEntities = new Map();
 
     this.geometry = {
       robe: new THREE.BoxGeometry(0.72, 1.3, 0.52),
@@ -145,6 +203,16 @@ export class WitchManager {
   update(delta, player, world) {
     const dt = Math.min(delta || 0, 0.08);
     this.elapsed += dt;
+
+    if (this._authority === 'server') {
+      const now = performance.now();
+      for (const witch of this.witches) {
+        if (witch.dead || !witch.serverOwned) continue;
+        _interpServerEntity(witch, now);
+      }
+      return;
+    }
+
     const playerPos = getWorldPosition(player, this.tmpPlayer);
 
     for (const witch of this.witches) {
@@ -253,7 +321,9 @@ export class WitchManager {
   }
 
   // --- damage / status / hit support (mirrors the other managers) -----------
+  // Server-authority: never mutate HP locally; the next snapshot resolves it.
   damageWitch(witch, amount) {
+    if (this._authority === 'server') return false;
     witch.health = Math.max(0, witch.health - amount);
     if (witch.health <= 0) {
       this.killWitch(witch);
@@ -438,9 +508,74 @@ export class WitchManager {
     return count;
   }
 
+  // --- server authority (multiplayer) --------------------------------------
+
+  setAuthority(mode) {
+    const next = mode === 'server' ? 'server' : 'local';
+    if (next === this._authority) return;
+    this._authority = next;
+    if (next === 'server') {
+      this.clearWitches();
+    } else {
+      this.clearServerEntities();
+    }
+  }
+
+  applyServerEnemy(snap) {
+    if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    let entity = this._serverEntities.get(snap.id);
+    if (!entity) {
+      const mesh = this.createWitchMesh(this._serverEntities.size);
+      mesh.position.set(snap.x, snap.y, snap.z);
+      mesh.rotation.y = snap.rotationY ?? 0;
+      entity = {
+        id: snap.id,
+        serverOwned: true,
+        health: snap.health ?? this.health,
+        maxHealth: snap.maxHealth ?? this.health,
+        mesh,
+        dead: false,
+        _buffer: [],
+        speed: 0,
+        throwTimer: Infinity,
+      };
+      mesh.userData.witch = entity;
+      this.group.add(mesh);
+      this.witches.push(entity);
+      this._serverEntities.set(snap.id, entity);
+    }
+    if (snap.health !== undefined) entity.health = snap.health;
+    if (snap.maxHealth !== undefined) entity.maxHealth = snap.maxHealth;
+    _pushServerSnap(entity._buffer, snap);
+  }
+
+  removeServerEnemy(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity) return false;
+    entity.dead = true;
+    entity.mesh.visible = false;
+    this.group.remove(entity.mesh);
+    this._serverEntities.delete(id);
+    const idx = this.witches.indexOf(entity);
+    if (idx >= 0) this.witches.splice(idx, 1);
+    return true;
+  }
+
+  clearServerEntities() {
+    for (const entity of this._serverEntities.values()) {
+      entity.dead = true;
+      this.group.remove(entity.mesh);
+      const idx = this.witches.indexOf(entity);
+      if (idx >= 0) this.witches.splice(idx, 1);
+    }
+    this._serverEntities.clear();
+  }
+
   dispose() {
     if (this.group.parent) this.group.parent.remove(this.group);
     this.clearWitches();
+    this.clearServerEntities();
     for (const geometry of Object.values(this.geometry)) geometry.dispose();
     for (const material of Object.values(this.material)) material.dispose();
   }

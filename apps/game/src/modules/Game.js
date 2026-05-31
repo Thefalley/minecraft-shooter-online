@@ -17,6 +17,7 @@ import { Shop } from './Shop.js';
 import { MageController } from './MageController.js';
 import { BALANCE } from './GameBalance.js';
 import { WorldSync } from '../networking/WorldSync.js';
+import { EnemySync } from '../networking/EnemySync.js';
 
 export class Game {
   constructor(root, options = {}) {
@@ -130,6 +131,24 @@ export class Game {
     });
     this.skeletons = new SkeletonManager(this.scene, { bounds, world: this.world, ...BALANCE.skeletons });
     this.witches = new WitchManager(this.scene, { bounds, world: this.world, ...BALANCE.witches });
+
+    // Multiplayer: route every enemy from server-broadcast state instead of
+    // local AI. EnemySync.enable() flips authority on all four managers and
+    // subscribes to the bridge's enemySpawn / enemyState / enemyDespawn /
+    // dragonFireball events. Singleplayer skips this entirely.
+    if (this.network && typeof this.network.getBridge === 'function') {
+      const enemyBridge = this.network.getBridge();
+      if (enemyBridge) {
+        this._enemySync = new EnemySync({
+          bridge: enemyBridge,
+          zombies: this.zombies,
+          skeletons: this.skeletons,
+          witches: this.witches,
+          dragons: this.dragons,
+        });
+        this._enemySync.enable();
+      }
+    }
 
     // Aggregator that fans hits/effects out to every enemy manager.
     const managers = [this.dragons, this.zombies, this.skeletons, this.witches];
@@ -1257,6 +1276,8 @@ export class Game {
     this.renderer.setAnimationLoop(null);
     this._worldSync?.disable?.();
     this._worldSync = null;
+    this._enemySync?.disable?.();
+    this._enemySync = null;
     this.input.dispose?.();
     this.hud.destroy?.();
     this.shop?.hide?.();

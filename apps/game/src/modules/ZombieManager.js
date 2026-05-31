@@ -2,6 +2,61 @@ import * as THREE from 'three';
 
 const DEFAULT_BOUNDS = { minX: -22, maxX: 22, minZ: -22, maxZ: 22 };
 
+// Snapshot interpolation tuning for server-driven entities. Matches the
+// RemotePlayerMesh pattern: render ~120ms in the past so we always have two
+// real samples bracketing the playback time.
+const SERVER_SNAPSHOT_BUFFER = 8;
+const SERVER_INTERP_DELAY_MS = 120;
+
+function _pushServerSnap(buffer, snap) {
+  const now = performance.now();
+  const last = buffer[buffer.length - 1];
+  if (last && last.t >= now) return; // drop dupes / out-of-order
+  buffer.push({
+    t: now,
+    x: Number.isFinite(snap.x) ? snap.x : 0,
+    y: Number.isFinite(snap.y) ? snap.y : 0,
+    z: Number.isFinite(snap.z) ? snap.z : 0,
+    rotationY: Number.isFinite(snap.rotationY) ? snap.rotationY : 0,
+  });
+  if (buffer.length > SERVER_SNAPSHOT_BUFFER) buffer.shift();
+}
+
+function _shortAngleDelta(from, to) {
+  let d = to - from;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+function _interpServerEntity(entity, now) {
+  const buf = entity._buffer;
+  if (!buf || buf.length === 0) return;
+  const renderT = now - SERVER_INTERP_DELAY_MS;
+  const pos = entity.mesh.position;
+  if (renderT <= buf[0].t) {
+    pos.set(buf[0].x, buf[0].y, buf[0].z);
+    entity.mesh.rotation.y = buf[0].rotationY;
+    return;
+  }
+  const newest = buf[buf.length - 1];
+  if (renderT >= newest.t) {
+    pos.set(newest.x, newest.y, newest.z);
+    entity.mesh.rotation.y = newest.rotationY;
+    return;
+  }
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t > renderT) i--;
+  const a = buf[i];
+  const b = buf[i + 1];
+  const span = b.t - a.t;
+  const alpha = span > 0 ? (renderT - a.t) / span : 0;
+  pos.x = a.x + (b.x - a.x) * alpha;
+  pos.y = a.y + (b.y - a.y) * alpha;
+  pos.z = a.z + (b.z - a.z) * alpha;
+  entity.mesh.rotation.y = a.rotationY + _shortAngleDelta(a.rotationY, b.rotationY) * alpha;
+}
+
 function getWorldPosition(target, fallback = new THREE.Vector3()) {
   if (!target) return fallback.set(0, 0, 0);
   if (target.isVector3) return fallback.copy(target);
@@ -46,6 +101,11 @@ export class ZombieManager {
     this.tmpPlayer = new THREE.Vector3();
     this.tmpDir = new THREE.Vector3();
     this.tmpRaycaster = new THREE.Raycaster();
+
+    // Multiplayer: 'server' disables local AI/spawn and switches update() to
+    // pure snapshot interpolation. Default 'local' preserves singleplayer.
+    this._authority = 'local';
+    this._serverEntities = new Map(); // id -> zombie wrapper (serverOwned=true)
 
     this.geometry = {
       body: new THREE.BoxGeometry(0.8, 1.3, 0.5),
@@ -249,6 +309,18 @@ export class ZombieManager {
   update(delta, player, world) {
     const dt = Math.min(delta || 0, 0.08);
     this.elapsed += dt;
+
+    // Server-authoritative mode: no AI, no spawning, no attacks. Just
+    // interpolate every server-owned visual toward its newest snapshot.
+    if (this._authority === 'server') {
+      const now = performance.now();
+      for (const zombie of this.zombies) {
+        if (zombie.dead || !zombie.serverOwned) continue;
+        _interpServerEntity(zombie, now);
+      }
+      return;
+    }
+
     const playerPos = getWorldPosition(player, this.tmpPlayer);
     const guardActive = Boolean(player?.guardActive);
 
@@ -349,7 +421,12 @@ export class ZombieManager {
   }
 
   // Applies damage. The invincible training dummy just tallies the damage.
+  // In server-authority mode, the client never mutates HP — it just reports
+  // "no kill" so the caller can still play the visual impact effect. The
+  // real HP/kill resolution arrives via the next server snapshot (or a
+  // future hit-pipeline event from the weapons agent).
   damageZombie(zombie, amount) {
+    if (this._authority === 'server') return false;
     if (zombie.dummy) {
       zombie.damageAccum = (zombie.damageAccum || 0) + amount;
       return false;
@@ -563,9 +640,97 @@ export class ZombieManager {
     return events;
   }
 
+  // --- server authority (multiplayer) --------------------------------------
+
+  /**
+   * Switch between singleplayer ('local') and multiplayer ('server') modes.
+   * - 'local': existing AI runs unchanged.
+   * - 'server': update() becomes a no-op for AI; only server-driven entities
+   *   render, animated by interpolation between snapshots.
+   *
+   * Side effect: changing modes clears any entities that belong to the
+   * opposite mode so the scene stays consistent.
+   */
+  setAuthority(mode) {
+    const next = mode === 'server' ? 'server' : 'local';
+    if (next === this._authority) return;
+    this._authority = next;
+    if (next === 'server') {
+      // Drop any locally-spawned zombies that were left around so the player
+      // only sees server-broadcast enemies.
+      this.clearZombies();
+    } else {
+      // Returning to singleplayer — toss any server-driven visuals.
+      this.clearServerEntities();
+    }
+  }
+
+  /**
+   * Upsert a server-broadcast zombie. Called by EnemySync on enemySpawn /
+   * enemyState. The first call for an id spawns the visual; subsequent
+   * calls just push to its interpolation buffer.
+   */
+  applyServerEnemy(snap) {
+    if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    let entity = this._serverEntities.get(snap.id);
+    if (!entity) {
+      const mesh = this.createZombieMesh(this._serverEntities.size);
+      mesh.position.set(snap.x, snap.y, snap.z);
+      mesh.rotation.y = snap.rotationY ?? 0;
+      entity = {
+        id: snap.id,
+        serverOwned: true,
+        health: snap.health ?? this.health,
+        maxHealth: snap.maxHealth ?? this.health,
+        mesh,
+        dead: false,
+        _buffer: [],
+        // Locally-required AI fields that hit code reads — defaults are fine
+        // because no AI runs in server mode.
+        speed: 0,
+        damage: 0,
+        attackTimer: Infinity,
+      };
+      mesh.userData.zombie = entity;
+      this.group.add(mesh);
+      this.zombies.push(entity);
+      this._serverEntities.set(snap.id, entity);
+    }
+    if (snap.health !== undefined) entity.health = snap.health;
+    if (snap.maxHealth !== undefined) entity.maxHealth = snap.maxHealth;
+    _pushServerSnap(entity._buffer, snap);
+  }
+
+  /**
+   * Remove a server-broadcast zombie. Returns true if it owned that id.
+   */
+  removeServerEnemy(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity) return false;
+    entity.dead = true;
+    entity.mesh.visible = false;
+    this.group.remove(entity.mesh);
+    this._serverEntities.delete(id);
+    const idx = this.zombies.indexOf(entity);
+    if (idx >= 0) this.zombies.splice(idx, 1);
+    return true;
+  }
+
+  clearServerEntities() {
+    for (const entity of this._serverEntities.values()) {
+      entity.dead = true;
+      this.group.remove(entity.mesh);
+      const idx = this.zombies.indexOf(entity);
+      if (idx >= 0) this.zombies.splice(idx, 1);
+    }
+    this._serverEntities.clear();
+  }
+
   dispose() {
     if (this.group.parent) this.group.parent.remove(this.group);
     this.clearZombies();
+    this.clearServerEntities();
     for (const geometry of Object.values(this.geometry)) geometry.dispose();
     for (const material of Object.values(this.material)) material.dispose();
   }
