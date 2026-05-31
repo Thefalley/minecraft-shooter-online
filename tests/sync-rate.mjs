@@ -37,6 +37,33 @@ let hostClient, hostRoom;
 let probeClient, probeRoom;
 let browser, page;
 
+// Warm Vercel + Render before the test clock starts. Free tiers nap and the
+// first request from a Linux CI runner can take 20-30 s — that wake-up cost
+// is what caused the recurring CI flake on this suite.
+try {
+  const httpServer = SERVER.replace(/^ws/, 'http');
+  for (let i = 0; i < 6; i += 1) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      const r = await fetch(`${httpServer}/health`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(LOBBY, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+} catch {}
+
 try {
   // Setup: host + raw probe + browser probe all in the same room.
   hostClient = await createClient(SERVER);
@@ -110,12 +137,12 @@ try {
   page = await ctx.newPage();
 
   await r.check('browser client renders enemy motion at ≥3Hz', async () => {
-    await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 60000 });
     await page.fill('#name', 'SBrowser');
     await page.fill('#code', code);
     await page.click('button:has-text("Unirse")');
-    await page.waitForURL(/voxel-dragons-game/, { timeout: 20000 });
-    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 20000 });
+    await page.waitForURL(/voxel-dragons-game/, { timeout: 40000 });
+    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 40000 });
     // EnemySync needs a beat to backfill + WorldSync regenerates terrain +
     // a few server ticks have to land so the buffer has >1 entry for the
     // interpolator to lerp between.

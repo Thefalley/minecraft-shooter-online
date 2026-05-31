@@ -45,6 +45,33 @@ async function dumpRing(page) {
   return await page.evaluate(() => window.__voxelDebug?.ring ?? []);
 }
 
+// Warm both Vercel and Render before launching 3 browsers. CI's first
+// request on a cold deploy takes 20+ s and the 30 s navigation timeout
+// inside Playwright was tripping on this exact race.
+try {
+  const httpServer = SERVER.replace(/^ws/, 'http');
+  for (let i = 0; i < 6; i += 1) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      const r = await fetch(`${httpServer}/health`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(LOBBY, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+} catch {}
+
 try {
   // Headless host (no browser, raw Colyseus) — owns the room and starts the game.
   hostClient = await createClient(SERVER);
@@ -64,12 +91,12 @@ try {
   for (let i = 0; i < N_CLIENTS; i += 1) {
     const ctx = await browser.newContext({ viewport: { width: 1024, height: 700 } });
     const page = await ctx.newPage();
-    await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 60000 });
     await page.fill('#name', `MCK${i + 1}`);
     await page.fill('#code', code);
     await page.click('button:has-text("Unirse")');
-    await page.waitForURL(/voxel-dragons-game/, { timeout: 20000 });
-    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 25000 });
+    await page.waitForURL(/voxel-dragons-game/, { timeout: 40000 });
+    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 40000 });
     pages.push(page);
   }
   // Let every client finish EnemySync backfill and reach the same state.
