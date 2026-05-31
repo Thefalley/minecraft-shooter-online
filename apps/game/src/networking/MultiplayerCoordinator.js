@@ -169,20 +169,20 @@ export class MultiplayerCoordinator {
       if (!snap) return;
 
       if (snap.sessionId === this._selfSessionId) {
-        // Self: feed into the CSP path. Fall back to setPosition if the
-        // applyServerSnapshot method isn't present (e.g. CSP agent branch
-        // hasn't merged yet) so we degrade gracefully.
+        // Self snapshot. The upstream Voxel-Dragons Player has NO
+        // applyServerSnapshot (it's singleplayer code with no CSP
+        // reconciliation), so the previous fallback to p.setPosition()
+        // teleported the local player to the server's stored position
+        // every 50 ms — which is PLAYER_SPAWN_Y (1.0). The user fell from
+        // their client-side terrain spawn at Y≈9 down to Y=1 and stayed
+        // buried in stone. Only apply self snapshots if Player exposes
+        // the CSP method. Otherwise trust local prediction; the input
+        // pump in Game._pumpMPInput keeps the server's stored position
+        // tracking the player accurately enough for AI and broadcasts.
         const p = this._game?.player;
         if (!p) return;
         if (typeof p.applyServerSnapshot === "function") {
           p.applyServerSnapshot(snap);
-        } else if (
-          typeof p.setPosition === "function" &&
-          Number.isFinite(snap.x) &&
-          Number.isFinite(snap.y) &&
-          Number.isFinite(snap.z)
-        ) {
-          p.setPosition(snap.x, snap.y, snap.z);
         }
       } else {
         this._registry?.onSnapshot(snap);

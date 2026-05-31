@@ -190,6 +190,47 @@ try {
     return 'pointerLockElement set';
   });
 
+  // ─── Player does NOT spawn / fall underground ──────────────
+  // Regression for the bug where MultiplayerCoordinator's self-snapshot
+  // handler called p.setPosition(server.x, 1, server.z) every 50 ms
+  // because upstream Player has no applyServerSnapshot — teleporting
+  // the user from their terrain-aware client spawn (Y≈9) down to the
+  // server's PLAYER_SPAWN_Y (1.0). The user landed buried inside stone.
+  await r.check('player stays above ground for the first 5 s', async () => {
+    const samples = await page.evaluate(async () => {
+      const out = [];
+      for (let i = 0; i < 25; i += 1) {
+        const g = window.__voxelGame;
+        if (g?.player) {
+          const p = g.player.cameraHolder?.position ?? g.player.position;
+          if (p) out.push({ t: i * 200, y: +p.y.toFixed(2), x: +p.x.toFixed(2), z: +p.z.toFixed(2) });
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      return out;
+    });
+    if (samples.length < 10) throw new Error(`only ${samples.length} samples`);
+    const ys = samples.map((s) => s.y);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    // Server's PLAYER_SPAWN_Y is 1.0. If we ever fall to that, it's the
+    // self-snapshot teleport bug.
+    if (minY <= 2.0) {
+      const buried = samples.find((s) => s.y <= 2.0);
+      throw new Error(
+        `player Y dropped to ${minY.toFixed(2)} (server ghost). First buried sample: t=${buried.t}ms pos=(${buried.x}, ${buried.y}, ${buried.z})`
+      );
+    }
+    // Detect a hard teleport (>5u drop between consecutive samples).
+    for (let i = 1; i < samples.length; i += 1) {
+      const drop = samples[i - 1].y - samples[i].y;
+      if (drop > 5) {
+        throw new Error(`Y teleport drop of ${drop.toFixed(2)}u between t=${samples[i - 1].t} and t=${samples[i].t}`);
+      }
+    }
+    return `Y range [${minY.toFixed(1)}, ${maxY.toFixed(1)}] across ${samples.length} samples (no teleport)`;
+  });
+
   // ─── WASD presses change the player's local position ──────
   await r.check('keyboard W moves player forward (server broadcast → local mesh)', async () => {
     const before = await page.evaluate(() => {
