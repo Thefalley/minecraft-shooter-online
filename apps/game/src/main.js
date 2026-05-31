@@ -1,7 +1,12 @@
 import './styles.css';
-import { Game } from './modules/Game.js';
-import { Menu } from './modules/Menu.js';
-import { CHARACTERS } from './modules/Characters.js';
+import { Game } from './game/Game.js';
+import { Menu } from './ui/Menu.js';
+import { ModeMenu } from './ui/ModeMenu.js';
+import { CampaignMenu } from './ui/CampaignMenu.js';
+import { CHARACTERS, getCharacter } from './content/characters/Characters.js';
+import { MAPS, getMap } from './content/maps/index.js';
+import { CAMPAIGNS } from './content/campaigns/index.js';
+import { createWebPlatform } from './platform/web/createWebPlatform.js';
 import {
   MultiplayerCoordinator,
   readJoinParams,
@@ -15,25 +20,58 @@ function findCharacter(id) {
   return CHARACTERS.find((c) => c.id === id) ?? CHARACTERS[0];
 }
 
-function showMenu() {
-  const menu = new Menu(root, CHARACTERS, (character) => {
-    menu.hide();
-    const game = new Game(root, { character, onExit: showMenu });
-    game.start();
+// ─── Singleplayer / debug menus (upstream flow) ──────────────────────
+//
+// Reachable with ?solo=1. The lobby is the production entry point — bare
+// game URL bounces back to it (see bottom of file).
+
+function launchSolo(options) {
+  const platform = createWebPlatform({ root });
+  const game = new Game(root, { platform, onExit: showModeMenu, ...options });
+  game.start();
+}
+
+function showModeMenu() {
+  const menu = new ModeMenu(root, {
+    onWaves: () => { menu.hide(); showWavesMenu(); },
+    onCampaign: () => { menu.hide(); showCampaignMenu(); },
   });
 }
 
-/**
- * Multiplayer flow:
- *   1. URL params (?code=&name=&mode=) come from the lobby (apps/web).
- *   2. Coordinator connects to Colyseus.
- *   3. We show the WaitingRoom (room code + player list + character cards +
- *      host-only "Empezar partida"). Other agents own this UI.
- *   4. When the server flips phase to "playing", WaitingRoom's onStart fires
- *      and we instantiate Game with network=coordinator. game.start() runs the
- *      regular renderer loop with CSP wiring.
- *   5. On Esc / exit: stop the coordinator, clear URL params, back to menu.
- */
+function showWavesMenu() {
+  const menu = new Menu(root, CHARACTERS, MAPS, (character, map) => {
+    menu.hide();
+    launchSolo({ character, map, mode: 'waves' });
+  });
+}
+
+function showCampaignMenu() {
+  const menu = new CampaignMenu(
+    root,
+    CAMPAIGNS,
+    (campaign) => {
+      menu.hide();
+      launchSolo({
+        character: getCharacter(campaign.character),
+        map: getMap(campaign.map),
+        mode: 'campaign',
+        campaign,
+      });
+    },
+    () => { menu.hide(); showModeMenu(); },
+  );
+}
+
+// ─── Multiplayer flow ────────────────────────────────────────────────
+//
+// 1. URL params (?code=&name=&mode=) come from the lobby (apps/web).
+// 2. Coordinator connects to Colyseus.
+// 3. WaitingRoom (room code + player list + character cards + host start).
+// 4. Host clicks "Empezar partida" → onStart fires → spawn Game with
+//    network=coordinator, EnemySync+WorldSync take over from the local
+//    AI, the server's WaveDirector drives every enemy and dragon.
+// 5. On Esc / disconnect: tear down coordinator, return to lobby.
+
 async function startMultiplayer({ name, code, characterId, mode }) {
   const initialCharacter = findCharacter(characterId);
   let coordinator = null;
@@ -53,35 +91,22 @@ async function startMultiplayer({ name, code, characterId, mode }) {
     coordinator = new MultiplayerCoordinator({
       joinParams: { name, code, mode, characterId: initialCharacter.id },
     });
-
-    // Open the connection FIRST — bind() needs a Game and we don't have one
-    // yet; the WaitingRoom is happy with just the bridge.
     await coordinator.start();
-
     const bridge = coordinator.getBridge();
 
-    // Persistent overlay (top-right FPS/PING + room code) — mirrors apps/web.
     stats = new StatsOverlay();
     stats.mount();
-    // Welcome may have already fired (we awaited start() above) — try to
-    // grab the room code immediately, and also subscribe so a reconnect
-    // updates it.
     const initialCode = bridge.getRoomCode?.() ?? bridge.getRoomState?.()?.roomCode ?? null;
     if (initialCode) stats.setRoomCode(initialCode);
     bridge.on?.('welcome', (p) => stats?.setRoomCode?.(p?.roomCode));
 
-    // If the URL hinted at a character (via the lobby flow), tell the
-    // server up front so other clients render it correctly even before the
-    // user clicks a card.
     if (initialCharacter?.id && typeof bridge.emitCharacterSelect === 'function') {
       bridge.emitCharacterSelect(initialCharacter.id);
     }
 
-    // If the bridge fails / disconnects mid-game, route the user back to
-    // the menu instead of leaving them frozen on a half-rendered scene.
     coordinator.onDisconnect?.((status) => {
       console.warn('[mp] coordinator disconnected:', status);
-      teardown().finally(() => showMenu());
+      teardown().finally(() => showModeMenu());
     });
 
     waitingRoom = new WaitingRoom(root, bridge, {
@@ -90,53 +115,55 @@ async function startMultiplayer({ name, code, characterId, mode }) {
         try { waitingRoom?.dispose(); } catch { /* ignore */ }
         waitingRoom = null;
 
-        // Read the character the user finally landed on, defaulting to their
-        // URL hint then to duck. The bridge keeps the last selection echoed
-        // back from the server in playerSnapshot events.
         const selfId = bridge.getSelfSessionId?.() ?? coordinator.getSelfSessionId();
         const state = bridge.getRoomState?.();
         const selfPlayer = state?.players?.get?.(selfId);
         const chosenId = selfPlayer?.characterId || initialCharacter.id;
         const character = findCharacter(chosenId);
 
+        // Multiplayer game uses 'waves' mode by default (lobby doesn't pick
+        // campaign yet) and the first available map. The server is the
+        // wave director so this mode only affects the local UI/HUD.
+        const platform = createWebPlatform({ root });
         const game = new Game(root, {
+          platform,
           character,
+          map: MAPS[0],
+          mode: 'waves',
           network: coordinator,
           onExit: async () => {
             await teardown();
-            showMenu();
+            showModeMenu();
           },
         });
         coordinator.bind(game);
         game.start();
-        // Mount the pointer-lock hint AFTER game.start() so it sits on top
-        // of the freshly-mounted canvas. Hides itself as soon as the player
-        // clicks and pointer lock engages.
+        // Pointer-lock hint sits on top of the freshly-mounted canvas.
         pointerHint = new PointerLockHint();
         pointerHint.mount();
       },
       onLeave: async () => {
         await teardown();
-        showMenu();
+        showModeMenu();
       },
     });
     waitingRoom.show();
   } catch (err) {
     console.error('[mp] could not start multiplayer, falling back to menu', err);
     await teardown();
-    showMenu();
+    showModeMenu();
   }
 }
 
-// The Voxel-Dragons game is the multiplayer client. The proper entry point
-// is the lobby (apps/web) which creates/joins a room and redirects here with
-// ?code=…&name=…&mode=. If someone lands here without those params they're
-// taking a wrong turn — bounce them back to the lobby so the experience is
-// consistent.
+// ─── Entry point ─────────────────────────────────────────────────────
 //
-// `?solo=1` is a debug escape hatch that keeps the imported singleplayer
-// menu reachable, useful for local dev and for verifying the original
-// Voxel-Dragons code still works after a refactor.
+// Lobby (apps/web) is the canonical entry point. The bare game URL has
+// no useful UI on its own — it redirects you back to the lobby.
+//
+// ?code=…&name=…&mode={create|join} → multiplayer (set by the lobby form)
+// ?solo=1                            → upstream singleplayer menus
+// no params                          → redirect to lobby URL
+
 const params = readJoinParams();
 const isSoloDebug = (() => {
   try {
@@ -149,7 +176,7 @@ const isSoloDebug = (() => {
 if (params.mode === 'create' || params.mode === 'join') {
   startMultiplayer(params);
 } else if (isSoloDebug) {
-  showMenu();
+  showModeMenu();
 } else {
   const lobbyUrl = import.meta.env.VITE_LOBBY_URL || 'https://minecraft-shooter-online-web.vercel.app';
   window.location.replace(lobbyUrl);

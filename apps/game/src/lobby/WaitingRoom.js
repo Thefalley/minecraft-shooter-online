@@ -22,7 +22,7 @@
 // happens in a later commit by the parent agent.
 
 import "./lobby.css";
-import { CHARACTERS } from "../modules/Characters.js";
+import { CHARACTERS } from "../content/characters/Characters.js";
 import { CharacterSelectStrip } from "./CharacterSelectStrip.js";
 
 const STYLE_ID = "vd-lobby-style";

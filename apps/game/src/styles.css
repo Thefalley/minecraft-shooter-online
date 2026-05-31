@@ -1,3 +1,9 @@
+@font-face {
+  font-family: 'PixelFont';
+  src: url('./assets/PressStart2P.ttf') format('truetype');
+  font-display: swap;
+}
+
 html,
 body,
 #app {
@@ -7,9 +13,16 @@ body,
   overflow: hidden;
   background: #0b1117;
   color: #f5f7fb;
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: 'PixelFont', 'Courier New', monospace;
 }
 
 canvas {
   display: block;
+}
+
+/* Pixel-art icons/sprites should never be smoothed when scaled up. */
+.vd-pixel,
+img.vd-pixel {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
 }
