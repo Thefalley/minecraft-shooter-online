@@ -156,9 +156,16 @@ export class DragonManager {
       // currentLOD. L2 is a flat billboard quad — still hittable so the
       // player can damage far dragons, just with a single mesh.
       dragon._lodMeshes = [[], [], []];
-      const lodGroups = [dragon.userData.lod0, dragon.userData.lod1, dragon.userData.lod2];
+      // The lod* groups are stored on the Three.Group (dragon.mesh) created by
+      // createDragonMesh, not on the wrapper object `dragon`. Confusing
+      // because createDragonMesh's local variable is also called `dragon` —
+      // there it refers to the Group. Access them via dragon.mesh.userData.
+      const ud = dragon.mesh.userData;
+      const lodGroups = [ud.lod0, ud.lod1, ud.lod2];
       for (let li = 0; li < lodGroups.length; li += 1) {
-        lodGroups[li].traverse((obj) => {
+        const lodGroup = lodGroups[li];
+        if (!lodGroup) continue; // defensive: skip if a LOD wasn't built
+        lodGroup.traverse((obj) => {
           if (obj.isMesh && obj.userData.dragonRoot === dragon.mesh) {
             dragon._lodMeshes[li].push(obj);
           }
@@ -493,11 +500,13 @@ export class DragonManager {
     else if (distSq < LOD1_MAX_DISTANCE_SQ) nextLOD = 1;
     else nextLOD = 2;
 
-    const ud = dragon.userData;
+    // Same wrapper vs Group confusion as in spawnDragons: the LOD groups live
+    // on the Three.Group (dragon.mesh), not on the wrapper.
+    const ud = dragon.mesh.userData;
     if (ud.currentLOD !== nextLOD) {
-      ud.lod0.visible = nextLOD === 0;
-      ud.lod1.visible = nextLOD === 1;
-      ud.lod2.visible = nextLOD === 2;
+      if (ud.lod0) ud.lod0.visible = nextLOD === 0;
+      if (ud.lod1) ud.lod1.visible = nextLOD === 1;
+      if (ud.lod2) ud.lod2.visible = nextLOD === 2;
       ud.currentLOD = nextLOD;
       // Swap the active collision-mesh list so raycasts only test the LOD
       // the player can see. Falls back to the L0 list if a list is empty.
