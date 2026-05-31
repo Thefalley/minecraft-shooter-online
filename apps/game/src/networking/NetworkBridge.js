@@ -505,5 +505,45 @@ export class NetworkBridge {
     } catch (err) {
       if (this._debug) console.warn("[bridge] enemies state binding", err);
     }
+
+    // Dragons (state.dragons.onAdd/onChange/onRemove). The dragon schema
+    // doesn't carry a `kind` field, so we inject `kind: 'dragon'` into the
+    // payload so EnemySync — which routes by snap.kind — knows to call
+    // the dragon manager's applyServerDragon path. Without this, dragons
+    // spawned by the server's WaveDirector never reach the client and the
+    // dragon manager stays empty in multiplayer.
+    try {
+      const dragons$ = $(state).dragons;
+      if (dragons$ && typeof dragons$.onAdd === "function") {
+        const wrap = (dragon, id) => ({
+          id,
+          enemy: dragon,
+          kind: "dragon",
+          // Mirror the flat-snapshot fields EnemySync reads off snap.* so
+          // it works regardless of which path it inspects first.
+          x: dragon?.x,
+          y: dragon?.y,
+          z: dragon?.z,
+          rotationY: dragon?.rotationY,
+          health: dragon?.health,
+          maxHealth: dragon?.maxHealth,
+        });
+        dragons$.onAdd((dragon, id) => {
+          this._emit("enemySpawn", wrap(dragon, id));
+          try {
+            $(dragon).onChange(() => {
+              this._emit("enemyState", wrap(dragon, id));
+            });
+          } catch {
+            /* non-fatal */
+          }
+        });
+        dragons$.onRemove?.((_dragon, id) => {
+          this._emit("enemyDespawn", { id, kind: "dragon" });
+        });
+      }
+    } catch (err) {
+      if (this._debug) console.warn("[bridge] dragons state binding", err);
+    }
   }
 }
