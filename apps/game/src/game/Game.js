@@ -9,6 +9,7 @@ import { WitchManager } from './enemies/WitchManager.js';
 import { createEnemyAggregator } from './enemies/EnemyAggregator.js';
 import { Profiler, profilerEnabledByDefault } from '../dev/Profiler.js';
 import { installProfileExporter } from '../dev/profileExporter.js';
+import { NetworkMetrics } from '../dev/NetworkMetrics.js';
 import { HUD } from '../ui/HUD.js';
 import { Effects } from '../engine/Effects.js';
 import { Inventory } from './Inventory.js';
@@ -39,6 +40,20 @@ export class Game {
           const g = window.__voxelGame;
           const bridge = g?.network?.getBridge?.();
           const state = bridge?.getRoomState?.();
+          // NetworkMetrics surface — RTT ring + last fetched server stats.
+          // We read off the live Game instance so an agent can call
+          // window.__voxelDebug.dump() from the console without setup.
+          const netStats = (typeof g?._networkMetrics?.getStats === 'function')
+            ? g._networkMetrics.getStats()
+            : null;
+          const serverStats = (typeof g?._networkMetrics?.getLastServerStats === 'function')
+            ? g._networkMetrics.getLastServerStats()
+            : null;
+          // Client-side per-frame snapshot from the existing Profiler. Lets
+          // dump() show FPS + frame-time alongside server tick rate.
+          const profSnap = (typeof g?.profiler?.snapshot === 'function')
+            ? g.profiler.snapshot()
+            : null;
           return {
             time: new Date().toISOString(),
             session: bridge?.getSelfSessionId?.() ?? null,
@@ -68,6 +83,19 @@ export class Game {
             },
             enemySync: { created: !!g?._enemySync, enabled: !!g?._enemySync?._enabled },
             worldSync: { created: !!g?._worldSync, enabled: !!g?._worldSync?._enabled },
+            // Client-side render perf snapshot (FPS + frame time). Mirrors
+            // what the Profiler HUD shows on screen when L is pressed.
+            client: profSnap ? {
+              fps: +profSnap.fps.toFixed(1),
+              frameMsAvg: +profSnap.frame.avg.toFixed(2),
+              frameMsP95: +profSnap.frame.p95.toFixed(2),
+              frameMsMax: +profSnap.frame.max.toFixed(2),
+            } : null,
+            // Bridge ping/pong RTT ring.
+            network: netStats,
+            // Most recent /debug/rooms/<code>/stats payload (refreshed at
+            // 0.2 Hz to avoid hammering Render's free tier).
+            server: serverStats,
             ring: this.ring.slice(-50),
           };
         },
@@ -82,6 +110,34 @@ export class Game {
     this.map = options.map ?? MAPS[0];
     this.onExit = options.onExit ?? null;
     this.network = options.network ?? null;
+    // Network performance sampler. Always on in MP (covers the whole
+    // production session); off in singleplayer unless ?debug=1 forces it
+    // (no network → nothing useful to sample, but we keep the surface live
+    // so a tester can flip ?debug=1 without code changes). Started in
+    // start() once the bridge handshake has resolved.
+    this._networkMetrics = null;
+    if (this.network && typeof this.network.getBridge === 'function') {
+      const _nmBridge = this.network.getBridge();
+      if (_nmBridge) {
+        this._networkMetrics = new NetworkMetrics({
+          bridge: _nmBridge,
+          onDebug: (cat, payload) => {
+            // Mirror server stats fetches into the ring so log-equivalence
+            // tests can correlate ("server agreed we have N enemies").
+            if (typeof window !== 'undefined' && window.__voxelDebug) {
+              window.__voxelDebug.push(cat, payload);
+            }
+          },
+        });
+      }
+    } else if (
+      typeof window !== 'undefined' &&
+      typeof URLSearchParams === 'function' &&
+      new URLSearchParams(window.location.search).get('debug') === '1'
+    ) {
+      // SP + ?debug=1: keep the field defined but no bridge → no sampling.
+      // The getter shape on __voxelDebug stays stable for harness scripts.
+    }
     // 'waves' (pick character + map) or 'campaign' (story rules in BALANCE.campaign).
     this.mode = options.mode ?? 'waves';
     this.campaign = options.campaign ?? null;
@@ -700,6 +756,10 @@ export class Game {
       // Server is the wave director. Seed this.wave for HUD/UI only.
       this.wave = 1;
     }
+    // Network metrics sampler: bridge handshake is resolved by the time
+    // start() runs (see MultiplayerCoordinator.start), so this is safe.
+    // Idempotent if start() is called twice for any reason.
+    try { this._networkMetrics?.startSampling?.(); } catch { /* ignore */ }
     this.platform.loop.start(() => this.tick());
     if (typeof window !== 'undefined') {
       window.__voxelGame = this;
@@ -792,6 +852,7 @@ export class Game {
       // and the circle follow them from above.
       this.player.update(delta, this.input, this.world);
       this.clampPlayerToBounds();
+      this._pumpMPInput();
       this.aerialCenter.copy(this.player.object.position);
       if (this.aerialCircle) {
         this.aerialCircle.position.copy(this.aerialCenter);
@@ -882,6 +943,11 @@ export class Game {
     if (this.character.loadout === 'guns') this.updateBlasterCharge(delta);
     else if (this.character.ability === 'samurai') this.updateTimeSlow(rawDelta);
     this.updateSamuraiSlashes(delta);
+    // Multiplayer: pump the player's current input + rotation to the server
+    // every frame so its authoritative position tracks the real player. Without
+    // this, the server thinks the player is still at spawn and the AI chases a
+    // ghost; the user's bullets miss because origin is far from server view.
+    this._pumpMPInput();
     p.end();
     p.begin('world');
     this.world.update(delta);
@@ -1039,6 +1105,53 @@ export class Game {
       inventory: this.inventory.snapshot(),
       locked: this.input.pointerLocked
     });
+  }
+
+  /**
+   * Send one vp:input frame to the server with the current WASD state and
+   * camera rotation. The NetworkBridge's InputPump throttles to 20 Hz and
+   * only actually sends on changes, so calling this every visual frame is
+   * cheap. Returns silently in singleplayer.
+   *
+   * Why this is in Game and not Player: the upstream Player has zero
+   * networking surface — keeping it untouched. The translation between
+   * Input.keys state and the server's protocol shape is composition,
+   * not movement logic.
+   */
+  _pumpMPInput() {
+    if (!this.network) return;
+    const inp = this.input;
+    if (!inp) return;
+    const keys = inp.keys || inp.pressed || inp.down || {};
+    const k = (...names) => {
+      for (const n of names) {
+        if (inp[n]) return true;
+        if (keys instanceof Set && keys.has(n)) return true;
+        if (keys && keys[n]) return true;
+      }
+      return false;
+    };
+    const cmd = {
+      forward: k('KeyW', 'w', 'forward', 'moveForward'),
+      backward: k('KeyS', 's', 'backward', 'moveBackward'),
+      left: k('KeyA', 'a', 'left', 'moveLeft'),
+      right: k('KeyD', 'd', 'right', 'moveRight'),
+      jump: k('Space', ' ', 'space', 'jump'),
+      rotationY: this.player?.cameraHolder?.rotation?.y ?? 0,
+      pitch: this.player?.pitchHolder?.rotation?.x ?? 0,
+      seq: (this._inputSeq = (this._inputSeq ?? 0) + 1),
+    };
+    try {
+      if (typeof this.network.pushInput === 'function') {
+        this.network.pushInput(cmd);
+      } else if (typeof this.network.getBridge === 'function') {
+        this.network.getBridge()?.pushInput?.(cmd);
+      }
+    } catch (err) {
+      if (typeof window !== 'undefined' && window.__voxelDebug) {
+        window.__voxelDebug.push('mp:input:error', { err: String(err) });
+      }
+    }
   }
 
   clampPlayerToBounds() {
@@ -2115,6 +2228,8 @@ export class Game {
     // a disposed pool.
     try { this._enemySync?.disable?.(); } catch { /* ignore */ }
     try { this._worldSync?.disable?.(); } catch { /* ignore */ }
+    try { this._networkMetrics?.stopSampling?.(); } catch { /* ignore */ }
+    this._networkMetrics = null;
     // Drop the bridge waveStart / waveCinematic listeners installed in the
     // constructor.
     if (Array.isArray(this._netUnsubs)) {
