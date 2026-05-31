@@ -134,16 +134,21 @@ export class Game {
         this._worldSync = new WorldSync(this.world, bridge, {
           onWorldRebuilt: () => {
             if (!this.player || typeof this.player.setPosition !== 'function') return;
-            const selfId = bridge.getSelfSessionId?.();
-            const state = bridge.getRoomState?.();
-            const me = selfId ? state?.players?.get?.(selfId) : null;
-            if (me && Number.isFinite(me.x) && Number.isFinite(me.y) && Number.isFinite(me.z)) {
-              this.player.setPosition(me.x, me.y, me.z);
-              if (typeof window !== 'undefined' && window.__voxelDebug) {
-                window.__voxelDebug.push('player:spawn:server', { x: me.x, y: me.y, z: me.z });
-              }
-            } else {
-              this.player.setPosition(...this.world.getSpawnPoint().toArray());
+            // The server stores all players at PLAYER_SPAWN_Y (a flat 1.0)
+            // and a default XZ — it has no terrain knowledge. The upstream
+            // world is procedurally terraced (meadow, snowland) so trusting
+            // the server's spawn would bury us or float us. Use the same
+            // deterministic getSpawnPoint() the singleplayer flow uses —
+            // because every client regenerates from the SAME server seed,
+            // every client lands at the SAME spawn point AND it sits exactly
+            // on terrain. CSP reconciles our position to the server on the
+            // first input frame.
+            const [sx, sy, sz] = this.world.getSpawnPoint().toArray();
+            this.player.setPosition(sx, sy, sz);
+            if (typeof window !== 'undefined' && window.__voxelDebug) {
+              window.__voxelDebug.push('player:spawn:terrain', {
+                x: sx, y: sy, z: sz,
+              });
             }
           },
         });
@@ -151,10 +156,22 @@ export class Game {
       }
     }
 
+    // Multiplayer wiring for Weapons: when the bridge is up, fire() emits
+    // a vp:weapon:fire intent and the local raycast becomes purely visual
+    // (every enemy manager is in server authority, so the local hit doesn't
+    // mutate HP — the authoritative kill arrives via state schema diffs).
+    const weaponsNetwork =
+      this.network && typeof this.network.getBridge === 'function'
+        ? this.network.getBridge()
+        : null;
+    const weaponsSlotIndexProvider = () => this.inventory?.selectedIndex ?? -1;
+
     this.weapons = new Weapons({
       camera: this.camera,
       scene: this.scene,
       weapons: BALANCE.weapons,
+      network: weaponsNetwork,
+      slotIndexProvider: weaponsSlotIndexProvider,
       callbacks: {
         onHit: (hit) => {
           if (hit.weapon?.id === 'dagger' && hit.point) {
@@ -204,6 +221,7 @@ export class Game {
     });
     this.zombies = new ZombieManager(this.scene, {
       bounds,
+      world: this.world,
       camera: this.camera,
       health: BALANCE.zombies.health,
       speed: BALANCE.zombies.speed,

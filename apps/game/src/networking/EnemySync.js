@@ -45,6 +45,10 @@ function flattenEnemySnapshot(payload) {
     (typeof e.kind === "string" && e.kind) ||
     (typeof payload.kind === "string" && payload.kind) ||
     null;
+  // Wave-5 miniboss flag: set on the DragonState schema by the server. We
+  // propagate it so DragonManager.applyServerDragon can render the boss
+  // (red tint, larger scale) instead of a regular dragon visual.
+  const boss = e.boss === true || payload.boss === true;
   return {
     id,
     kind,
@@ -54,6 +58,7 @@ function flattenEnemySnapshot(payload) {
     rotationY: Number.isFinite(e.rotationY) ? e.rotationY : 0,
     health: Number.isFinite(e.health) ? e.health : undefined,
     maxHealth: Number.isFinite(e.maxHealth) ? e.maxHealth : undefined,
+    boss,
   };
 }
 
@@ -109,6 +114,11 @@ export class EnemySync {
     // best-effort cues for an attack animation / arrow flash / potion arc.
     on("enemyEvent", (p) => this._onEnemyEvent(p));
 
+    // Authoritative weapon-hit broadcast — every client (not just the
+    // shooter) gets one of these per confirmed hit so the impact flash on
+    // the target reads consistently across the room.
+    on("weaponHit", (p) => this._onWeaponHit(p));
+
     // Dragon fireballs: spawn / despawn / reflect a purely visual projectile.
     on("dragonFireball", (p) => this._onDragonFireball(p));
 
@@ -140,6 +150,7 @@ export class EnemySync {
             rotationY: dragon.rotationY,
             health: dragon.health,
             maxHealth: dragon.maxHealth,
+            boss: dragon.boss === true,
           });
           backfilledDragons += 1;
         });
@@ -256,6 +267,55 @@ export class EnemySync {
     if (typeof this._dragons.handleServerFireball === "function") {
       try { this._dragons.handleServerFireball(payload); }
       catch (err) { if (this._debug) console.warn("[EnemySync] fireball", err); }
+    }
+  }
+
+  /**
+   * Authoritative weapon-hit message from the server. Routes the visual
+   * impact flash to whichever manager owns the target id, regardless of
+   * who fired the shot. Payload shape (see protocol.WeaponHitPayload):
+   *
+   *   { seq, shotId, hits: [{ targetId, damage, point }] }
+   *
+   * targetId is "enemy:<id>" | "dragon:<id>" | "player:<sessionId>" — we
+   * dispatch enemy/dragon flashes here and leave player hits to the HUD
+   * damage indicator (already wired off the 'damage' event in the bridge).
+   */
+  _onWeaponHit(payload) {
+    if (!payload || !Array.isArray(payload.hits)) return;
+    for (const hit of payload.hits) {
+      if (!hit || typeof hit.targetId !== "string") continue;
+      const idx = hit.targetId.indexOf(":");
+      if (idx <= 0) continue;
+      const kind = hit.targetId.slice(0, idx);
+      const id = hit.targetId.slice(idx + 1);
+      if (typeof window !== "undefined" && window.__voxelDebug) {
+        window.__voxelDebug.push("weapon:hit", {
+          targetId: hit.targetId,
+          damage: hit.damage,
+        });
+      }
+      if (kind === "enemy") {
+        // Don't know which ground-mob manager owns the id (zombie/skeleton/
+        // witch share the "enemy:" namespace) — ask each in turn; only one
+        // will return true.
+        for (const m of [this._zombies, this._skeletons, this._witches]) {
+          if (m && typeof m.flashHit === "function") {
+            try {
+              if (m.flashHit(id)) break;
+            } catch (err) {
+              if (this._debug) console.warn("[EnemySync] flashHit", err);
+            }
+          }
+        }
+      } else if (kind === "dragon") {
+        if (this._dragons && typeof this._dragons.flashHit === "function") {
+          try { this._dragons.flashHit(id); }
+          catch (err) { if (this._debug) console.warn("[EnemySync] flashHit dragon", err); }
+        }
+      }
+      // "player:" hits are observed by the HUD via 'damage' event; no flash
+      // here so we don't double-trigger.
     }
   }
 }

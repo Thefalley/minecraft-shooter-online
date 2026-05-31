@@ -68,6 +68,45 @@ function getWorldPosition(target, fallback = new THREE.Vector3()) {
   return fallback.set(0, 0, 0);
 }
 
+/**
+ * Briefly flash every mesh under `root` red. Shared by every server-driven
+ * enemy/dragon manager so the visual cue on a server-confirmed hit reads
+ * the same across mob types. We mutate emissive instead of swapping
+ * materials so the existing slow/freeze tint path (which DOES swap) keeps
+ * its precedence.
+ *
+ * Schedules a setTimeout to revert ~120ms later. If the mesh is already
+ * mid-flash we just re-arm the timer so a stream of hits doesn't pile up.
+ */
+const HIT_FLASH_MS = 120;
+const HIT_FLASH_COLOR = new THREE.Color(0xff5555);
+function _flashEntityMesh(root) {
+  if (!root || typeof root.traverse !== 'function') return;
+  root.traverse((child) => {
+    if (!child.isMesh || !child.material) return;
+    const material = Array.isArray(child.material) ? child.material[0] : child.material;
+    if (!material || !('emissive' in material)) return;
+    if (!child.userData._hitFlashSaved) {
+      child.userData._hitFlashSaved = {
+        emissive: material.emissive ? material.emissive.clone() : new THREE.Color(0, 0, 0),
+        emissiveIntensity:
+          typeof material.emissiveIntensity === 'number' ? material.emissiveIntensity : 1,
+      };
+    }
+    if (material.emissive) material.emissive.copy(HIT_FLASH_COLOR);
+    if ('emissiveIntensity' in material) material.emissiveIntensity = 1.2;
+    if (child.userData._hitFlashTimer) clearTimeout(child.userData._hitFlashTimer);
+    child.userData._hitFlashTimer = setTimeout(() => {
+      const saved = child.userData._hitFlashSaved;
+      child.userData._hitFlashTimer = null;
+      if (!saved) return;
+      if (material.emissive) material.emissive.copy(saved.emissive);
+      if ('emissiveIntensity' in material) material.emissiveIntensity = saved.emissiveIntensity;
+    }, HIT_FLASH_MS);
+  });
+}
+export { _flashEntityMesh as _flashEntityMeshShared };
+
 function groundHeight(world, x, z, fallback = 0) {
   if (typeof world?.getGroundHeight === 'function') {
     return world.getGroundHeight(x, z);
@@ -112,6 +151,11 @@ export class ZombieManager {
     this.attackCooldown = options.attackCooldown ?? 1.1;
     this.spawnRadiusMin = options.spawnRadiusMin ?? 14;
     this.spawnRadiusMax = options.spawnRadiusMax ?? 24;
+    // World reference for ground-height queries in MP. Server broadcasts
+    // (x,z) but Y is a flat constant; client recomputes Y from terrain so
+    // server-driven zombies don't bury themselves in hills or float over
+    // valleys.
+    this.world = options.world ?? null;
 
     this.tmpPlayer = new THREE.Vector3();
     this.tmpDir = new THREE.Vector3();
@@ -702,6 +746,13 @@ export class ZombieManager {
    */
   applyServerEnemy(snap) {
     if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    // Override server's flat-Y with this client's actual terrain height.
+    // Otherwise zombies render at Y=PLAYER_SPAWN_Y (1.0) while the local
+    // ground at (snap.x, snap.z) may be at Y=5+, and they end up buried.
+    const groundY = (this.world && typeof this.world.getGroundHeight === 'function')
+      ? this.world.getGroundHeight(snap.x, snap.z)
+      : snap.y;
+    snap = { ...snap, y: groundY };
     let entity = this._serverEntities.get(snap.id);
     if (!entity) {
       const mesh = this.createZombieMesh(this._serverEntities.size);
@@ -755,6 +806,38 @@ export class ZombieManager {
       if (idx >= 0) this.zombies.splice(idx, 1);
     }
     this._serverEntities.clear();
+  }
+
+  /**
+   * Server-driven attack cue. The server broadcasts the actual Damage event,
+   * so locally we only need a brief visual nudge (a small shamble bob on the
+   * mesh) — no damage event is pushed because that would double-flash the
+   * HUD on top of the server's authoritative damage routing.
+   *
+   * @param {{enemyId:string|number, event:string}} payload
+   */
+  handleServerEnemyEvent(payload) {
+    if (this._authority !== 'server' || !payload) return;
+    if (payload.event !== 'attack') return;
+    const zombie = this._serverEntities.get(payload.enemyId);
+    if (!zombie || zombie.dead) return;
+    // Snap the torso forward a hair so the swing reads visually. The
+    // interpolation in update() will smooth it out over the next frame.
+    const torso = zombie.mesh.children?.[0];
+    if (torso?.rotation) torso.rotation.x = -0.35;
+  }
+
+  /**
+   * Server-driven hit flash. Called by EnemySync when a vs:weapon:hit message
+   * names this entity id. Briefly emits a red tint on the mesh so every
+   * client (including non-shooters) sees the impact. Returns true if owned.
+   */
+  flashHit(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity || entity.dead) return false;
+    _flashEntityMesh(entity.mesh);
+    return true;
   }
 
   dispose() {

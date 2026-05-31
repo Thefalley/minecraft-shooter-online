@@ -100,6 +100,7 @@ export class NetworkBridge {
     this._selfSessionId = null;
     this._roomCode = null;
     this._latestSnapshot = null;
+    this._lastWeaponHit = null;
     this._inputPump.push(null);
     this._setStatus("disconnected");
   }
@@ -190,6 +191,28 @@ export class NetworkBridge {
       mkey(VoxelClientMessage, "WeaponFire", "client:weapon:fire"),
       payload,
     );
+  }
+
+  /**
+   * Alias for {@link emitFireIntent}. The hit-pipeline agent names this
+   * `emitWeaponFire` so we expose both spellings — Weapons.js calls this one,
+   * other modules may already be calling emitFireIntent.
+   *
+   * Payload shape (mirrors `WeaponFireIntent` from @mvp/shared):
+   *   { seq, slotIndex, origin:[x,y,z], direction:[x,y,z], spreadSeed,
+   *     clientTime }
+   */
+  emitWeaponFire(payload) {
+    this.emitFireIntent(payload);
+  }
+
+  /**
+   * Last `vs:weapon:hit` payload seen on this bridge. Cached so the Weapons
+   * module can correlate the next visual frame with an authoritative hit
+   * without re-subscribing to the event bus. Cleared on disconnect.
+   */
+  getLastWeaponHit() {
+    return this._lastWeaponHit ?? null;
   }
 
   emitReloadIntent() {
@@ -364,7 +387,11 @@ export class NetworkBridge {
     onMsg(mkey(V, "EnemyState", "server:enemy:state"), "enemyState");
     onMsg(mkey(V, "EnemyEvent", "server:enemy:event"), "enemyEvent");
     onMsg(mkey(V, "DragonFireball", "server:dragon:fireball"), "dragonFireball");
-    onMsg(mkey(V, "WeaponHit", "server:weapon:hit"), "weaponHit");
+    onMsg(mkey(V, "WeaponHit", "server:weapon:hit"), "weaponHit", (p) => {
+      // Cache so a late subscriber (or the next viewmodel tick) can correlate.
+      this._lastWeaponHit = p;
+      return p;
+    });
     onMsg(mkey(V, "WeaponMiss", "server:weapon:miss"), "weaponMiss");
     onMsg(
       mkey(V, "WeaponReloadComplete", "server:weapon:reloadComplete"),
@@ -379,6 +406,21 @@ export class NetworkBridge {
         window.__voxelDebug.push("wave:start", {
           wave: p?.wave,
           totalWaves: p?.totalWaves,
+          boss: p?.boss === true,
+          cinematic: p?.cinematic === true,
+        });
+      }
+      return p;
+    });
+    // Wave-10 meteor cutscene trigger. The server broadcasts this once when
+    // entering the cinematic wave, then the room sits in 'playing' phase for
+    // METEOR_BALANCE.duration before resuming normal wave progression.
+    onMsg(mkey(V, "WaveCinematic", "server:wave:cinematic"), "waveCinematic", (p) => {
+      if (typeof window !== "undefined" && window.__voxelDebug) {
+        window.__voxelDebug.push("wave:cinematic", {
+          wave: p?.wave,
+          kind: p?.kind,
+          duration: p?.duration,
         });
       }
       return p;
@@ -548,6 +590,9 @@ export class NetworkBridge {
           rotationY: dragon?.rotationY,
           health: dragon?.health,
           maxHealth: dragon?.maxHealth,
+          // Wave-5 miniboss flag — DragonManager.applyServerDragon reads
+          // this to render the boss visuals.
+          boss: dragon?.boss === true,
         });
         dragons$.onAdd((dragon, id) => {
           this._emit("enemySpawn", wrap(dragon, id));

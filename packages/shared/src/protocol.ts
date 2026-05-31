@@ -76,6 +76,7 @@ export const VoxelServerMessage = {
   PlayerDeath: "vs:player:death",
   PlayerRespawn: "vs:player:respawn",
   WaveStart: "vs:wave:start",
+  WaveCinematic: "vs:wave:cinematic",
   WaveEnd: "vs:wave:end",
   ShopOpen: "vs:shop:open",
   ShopClose: "vs:shop:close",
@@ -146,8 +147,21 @@ export interface EnemySpawnPayload {
 }
 export interface EnemyEventPayload {
   enemyId: string;
-  event: "attack" | "shoot" | "throw" | "die";
+  event:
+    | "attack"
+    | "shoot"
+    | "throw"
+    | "die"
+    | "boss:ground"
+    | "boss:homing"
+    | "boss:bullet";
   target?: [number, number, number];
+  /**
+   * Optional origin override. The boss broadcasts projectile shots and needs
+   * to send its own world position (the client doesn't track an authoritative
+   * boss head position with sub-tick precision).
+   */
+  origin?: [number, number, number];
 }
 export interface DragonFireballPayload {
   fireball: FireballSnapshot;
@@ -174,6 +188,26 @@ export interface DamagePayload {
 export interface WaveStartPayload {
   wave: number;
   totalWaves: number;
+  /**
+   * When true the wave is a scripted cinematic (e.g. wave 10 meteor) — no
+   * enemies spawn. The room remains in 'playing' phase while the client plays
+   * the matching cutscene, then a second wave:start (or wave:cinematic end)
+   * resumes normal play.
+   */
+  cinematic?: boolean;
+  /**
+   * Wave-5 miniboss marker. Clients use this for HUD copy ("MINIBOSS:
+   * Dragón Rojo") and to suppress the regular "Wave N" toast.
+   */
+  boss?: boolean;
+}
+
+export interface WaveCinematicPayload {
+  wave: number;
+  /** Identifier of the cinematic. For now only "meteor" exists. */
+  kind: "meteor";
+  /** Total duration the room will spend in cinematic mode (seconds). */
+  duration: number;
 }
 export interface ShopOpenPayload {
   endsAt: number;

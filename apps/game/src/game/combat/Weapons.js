@@ -101,6 +101,76 @@ export class Weapons {
     this._scratchUp = new THREE.Vector3();
     this._scratchStep = new THREE.Vector3();
     this._scratchProjDir = new THREE.Vector3();
+
+    // Multiplayer wiring. When `network` is set, fire() also emits a
+    // WeaponFire intent and the local raycast becomes purely visual:
+    //   - hit detection still runs so the muzzle flash / tracer / impact
+    //     mark renders predictively at the right point, but every enemy
+    //     manager is already in `_authority === 'server'` mode (see
+    //     EnemySync.enable) so they don't mutate HP on a local hit.
+    //   - The authoritative kill arrives via vs:weapon:hit + the enemies
+    //     state schema diff, which clients apply through EnemySync.
+    //
+    // `network` may be:
+    //   - a NetworkBridge instance (we call .emitWeaponFire(payload)), or
+    //   - a function (we call it directly with the payload).
+    // `slotIndexProvider` returns the player's CURRENT inventory slot
+    // index (0..N), which is what the server uses to look up the weapon
+    // — Weapons.currentIndex is its INTERNAL gun array, not the same as
+    // the inventory slot.
+    this._network = options.network ?? null;
+    this._slotIndexProvider =
+      typeof options.slotIndexProvider === 'function' ? options.slotIndexProvider : null;
+    this._fireSeq = 0;
+  }
+
+  /**
+   * Set (or clear) the multiplayer bridge used to forward fire intents.
+   * Pass `null` to revert to singleplayer authority.
+   */
+  setNetwork(network) {
+    this._network = network ?? null;
+  }
+
+  /**
+   * Set (or clear) the function that returns the player's current inventory
+   * slot index. Used to populate `slotIndex` on the WeaponFire intent — that
+   * field references the inventory slot the server expects, not the local
+   * weapon array index.
+   */
+  setSlotIndexProvider(fn) {
+    this._slotIndexProvider = typeof fn === 'function' ? fn : null;
+  }
+
+  hasNetwork() {
+    return this._network !== null && this._network !== undefined;
+  }
+
+  _emitFireIntent(origin, direction, weapon) {
+    if (!this._network) return;
+    const slotIndex =
+      this._slotIndexProvider != null ? this._slotIndexProvider() : -1;
+    if (!Number.isInteger(slotIndex) || slotIndex < 0) return;
+    this._fireSeq = (this._fireSeq + 1) >>> 0;
+    const payload = {
+      seq: this._fireSeq,
+      slotIndex,
+      origin: [origin.x, origin.y, origin.z],
+      direction: [direction.x, direction.y, direction.z],
+      spreadSeed: (Math.random() * 0xffffffff) >>> 0,
+      clientTime: Date.now(),
+    };
+    try {
+      if (typeof this._network.emitWeaponFire === 'function') {
+        this._network.emitWeaponFire(payload);
+      } else if (typeof this._network.emitFireIntent === 'function') {
+        this._network.emitFireIntent(payload);
+      } else if (typeof this._network === 'function') {
+        this._network(payload);
+      }
+    } catch {
+      // Never let a transport failure abort the local visual flow.
+    }
   }
 
   get currentWeapon() {
@@ -175,6 +245,11 @@ export class Weapons {
     weapon.cooldownRemaining = 1 / Math.max(weapon.fireRate, 0.001);
 
     this._spawnMuzzleFlash(origin, direction, weapon, { ...context, scene });
+
+    // Multiplayer: forward the shot to the server as a fire intent. The
+    // server runs lag-compensated hit detection and broadcasts vs:weapon:hit
+    // back; visuals below are predictive only.
+    this._emitFireIntent(origin, direction, weapon);
 
     if (weapon.penetrate && context.penetrate !== false) {
       for (const payload of this._firePenetrating(origin, direction, weapon, { ...context, scene, targets })) {

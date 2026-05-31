@@ -45,6 +45,23 @@ let botClient = null;
 let botRoom = null;
 let roomCode = null;
 
+// Warm-up: hit /health a few times so Render's free-tier instance is awake
+// before the actual test clock starts. Render takes 10-30 s to wake from
+// sleep and that latency was the cause of CI flakes.
+try {
+  const httpBase = SERVER.replace(/^ws/, 'http');
+  for (let i = 0; i < 6; i += 1) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      const res = await fetch(`${httpBase}/health`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) break;
+    } catch { /* ignore + retry */ }
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+} catch { /* warm-up best-effort */ }
+
 try {
   // ─── Backend ──────────────────────────────────────────────
   await r.check('backend /health responds', async () => {

@@ -1,6 +1,8 @@
 import {
+  BOSS_BALANCE,
   DRAGON_BALANCE,
   ENEMY_BALANCE,
+  METEOR_BALANCE,
   PROGRESSION_BALANCE,
 } from "@mvp/shared";
 import { DragonState } from "../schema/DragonState.js";
@@ -126,34 +128,57 @@ export function spawnWave(
   wave: number,
   rand: () => number,
 ): SpawnedIds {
+  // Wave 10 is a scripted cinematic; the room broadcasts the meteor and the
+  // crater deltas, then spawns nothing. The caller (GameRoom) handles the
+  // cinematic transition; if someone routes through spawnWave directly we
+  // bail without touching state.
+  if (isCinematicWave(wave)) {
+    return { enemies: [], dragons: [] };
+  }
+
   const roster = rosterForWave(wave);
   const enemies: string[] = [];
   const dragons: string[] = [];
+
+  // Wave-5 miniboss: cut the regular roster by BOSS_BALANCE.enemyScale and
+  // suppress the normal dragons (we spawn the boss in their place).
+  const isBoss = isBossWave(wave);
+  const scale = isBoss ? BOSS_BALANCE.enemyScale : 1;
+  const zombiesN = Math.ceil(roster.zombies * scale);
+  const skeletonsN = Math.ceil(roster.skeletons * scale);
+  const witchesN = Math.ceil(roster.witches * scale);
+  const dragonsN = isBoss ? 0 : roster.dragons;
 
   // Ring radius for enemies: 12..20 around origin.
   const ringMin = ENEMY_BALANCE.zombies.spawnRadiusMin ?? 14;
   const ringMax = ENEMY_BALANCE.zombies.spawnRadiusMax ?? 24;
 
-  for (let i = 0; i < roster.zombies; i++) {
+  for (let i = 0; i < zombiesN; i++) {
     const e = makeEnemy("zombie", rand, ringMin, ringMax);
     state.enemies.set(e.id, e);
     enemies.push(e.id);
   }
-  for (let i = 0; i < roster.skeletons; i++) {
+  for (let i = 0; i < skeletonsN; i++) {
     const e = makeEnemy("skeleton", rand, ringMin, ringMax);
     state.enemies.set(e.id, e);
     enemies.push(e.id);
   }
-  for (let i = 0; i < roster.witches; i++) {
+  for (let i = 0; i < witchesN; i++) {
     const e = makeEnemy("witch", rand, ringMin, ringMax);
     state.enemies.set(e.id, e);
     enemies.push(e.id);
   }
 
-  for (let i = 0; i < roster.dragons; i++) {
+  for (let i = 0; i < dragonsN; i++) {
     const d = makeDragon(rand, i);
     state.dragons.set(d.id, d);
     dragons.push(d.id);
+  }
+
+  if (isBoss) {
+    const boss = makeBoss(rand);
+    state.dragons.set(boss.id, boss);
+    dragons.push(boss.id);
   }
 
   return { enemies, dragons };
@@ -211,7 +236,42 @@ function makeDragon(rand: () => number, index: number): DragonState {
     (DRAGON_BALANCE.baseAggression ?? 0.5) +
     index * (DRAGON_BALANCE.aggressionStep ?? 0.1);
   d.flags = 0;
+  d.boss = false;
   return d;
+}
+
+/**
+ * Wave-5 miniboss. A single red dragon with a giant HP pool that orbits the
+ * map at a fixed radius and cycles attack patterns. The aggression value is
+ * pegged near max so any leftover orbital fireballs (none, in practice) ramp
+ * up faster than a regular dragon would.
+ */
+function makeBoss(rand: () => number): DragonState {
+  const d = new DragonState();
+  d.id = allocDragonId();
+
+  const angle = rand() * Math.PI * 2;
+  d.x = Math.cos(angle) * BOSS_BALANCE.orbitRadius;
+  d.z = Math.sin(angle) * BOSS_BALANCE.orbitRadius;
+  d.y = BOSS_BALANCE.altitude;
+  d.rotationY = angle + Math.PI;
+
+  d.health = BOSS_BALANCE.health;
+  d.maxHealth = BOSS_BALANCE.health;
+  d.aggression = 0.95;
+  d.flags = 0;
+  d.boss = true;
+  return d;
+}
+
+/** True if `wave` is the boss wave (wave 5 by default). */
+export function isBossWave(wave: number): boolean {
+  return Math.trunc(wave) === BOSS_BALANCE.wave;
+}
+
+/** True if `wave` is a scripted cinematic wave (wave 10 by default). */
+export function isCinematicWave(wave: number): boolean {
+  return Math.trunc(wave) === METEOR_BALANCE.wave;
 }
 
 /** Reset the id allocators. Useful for tests. Not called in production. */

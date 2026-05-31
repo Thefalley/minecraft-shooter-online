@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { moveHorizontal, easeToGround } from '../../engine/Collision.js';
+import { _flashEntityMeshShared } from './ZombieManager.js';
 
 const DEFAULT_BOUNDS = { minX: -22, maxX: 22, minZ: -22, maxZ: 22 };
 const ENEMY_RADIUS = 0.4;
@@ -227,6 +228,10 @@ export class WitchManager {
         if (witch.dead || !witch.serverOwned) continue;
         _interpServerEntity(witch, now);
       }
+      // Tick visual-only potions spawned by server enemy:throw events so they
+      // arc + land. Damage/heal are server-authoritative; updatePotions tags
+      // its events accordingly to avoid mutating server-owned HP locally.
+      this.updatePotions(dt);
       return;
     }
 
@@ -318,7 +323,12 @@ export class WitchManager {
       const grounded = potion.position.y <= potion.target.y + 0.3;
       const blocked = this._blocked(potion.position);
       if (reached || grounded || blocked || potion.life <= 0 || potion.position.y < -4) {
-        this.events.push({ type: 'heal', position: potion.position.clone(), radius: this.healRadius, amount: this.healAmount });
+        // In server-authority mode, heal amount is zeroed so the visual FX
+        // (shockwave + impact) still plays while the server owns the actual
+        // health mutation. amount=0 keeps `enemies.heal(c,r,0)` a no-op for
+        // every manager that walks our local list of server-owned entities.
+        const amount = this._authority === 'server' ? 0 : this.healAmount;
+        this.events.push({ type: 'heal', position: potion.position.clone(), radius: this.healRadius, amount });
         this.group.remove(potion.mesh);
         this.potions.splice(i, 1);
       }
@@ -555,6 +565,12 @@ export class WitchManager {
 
   applyServerEnemy(snap) {
     if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    // Override server flat-Y with client terrain height — server uses
+    // PLAYER_SPAWN_Y=1 for all enemies; meadow/snowland terrain varies.
+    const groundY = (this.world && typeof this.world.getGroundHeight === 'function')
+      ? this.world.getGroundHeight(snap.x, snap.z)
+      : snap.y;
+    snap = { ...snap, y: groundY };
     let entity = this._serverEntities.get(snap.id);
     if (!entity) {
       const mesh = this.createWitchMesh(this._serverEntities.size);
@@ -602,6 +618,41 @@ export class WitchManager {
       if (idx >= 0) this.witches.splice(idx, 1);
     }
     this._serverEntities.clear();
+  }
+
+  /**
+   * Server-driven attack cue. Called by EnemySync when the server broadcasts
+   * vs:enemy:event for one of our witches. Visual-only: spawn a potion that
+   * arcs toward the server-provided target and self-resolves into a heal
+   * flash on impact (the actual heal is authoritative on the server).
+   *
+   * @param {{enemyId:string|number, event:string, target?:[number,number,number]}} payload
+   */
+  handleServerEnemyEvent(payload) {
+    if (this._authority !== 'server' || !payload) return;
+    if (payload.event !== 'throw') return;
+    const witch = this._serverEntities.get(payload.enemyId);
+    if (!witch || witch.dead) return;
+    const t = payload.target;
+    if (!Array.isArray(t) || t.length < 3) return;
+    const target = new THREE.Vector3(
+      Number.isFinite(t[0]) ? t[0] : 0,
+      Number.isFinite(t[1]) ? t[1] : 0,
+      Number.isFinite(t[2]) ? t[2] : 0,
+    );
+    try { this.throwPotion(witch, target); } catch { /* swallow visual errors */ }
+  }
+
+  /**
+   * Server-driven hit flash. Called by EnemySync on vs:weapon:hit. Returns
+   * true if this manager owns the given id.
+   */
+  flashHit(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity || entity.dead) return false;
+    _flashEntityMeshShared(entity.mesh);
+    return true;
   }
 
   dispose() {

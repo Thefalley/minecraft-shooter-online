@@ -1,14 +1,17 @@
 import { Room, Client } from "@colyseus/core";
 import {
   BLOCK_INTERACTION_RANGE,
+  BOSS_BALANCE,
   COINS_BALANCE,
   DEFAULT_WAVE_COUNT,
   DRAGON_BALANCE,
   FIREBALL_COLLISION_RADIUS,
   GAME_ROOM_NAME,
+  LAG_COMPENSATION_WINDOW_MS,
   LobbyClientMessage,
   LobbyServerMessage,
   MAX_PLAYERS_PER_ROOM,
+  METEOR_BALANCE,
   PLAYER_DEFAULT_HEALTH,
   PLAYER_MAX_DELTA,
   PLAYER_SPAWN_Y,
@@ -19,6 +22,7 @@ import {
   TICK_INTERVAL_MS,
   VoxelClientMessage,
   VoxelServerMessage,
+  WEAPON_BALANCE,
   WORLD_DEPTH,
   WORLD_HALF_SIZE,
   WORLD_MAX_HEIGHT,
@@ -38,6 +42,8 @@ import {
 } from "../systems/EnemyAI.js";
 import {
   allocFireballId,
+  isBossWave,
+  isCinematicWave,
   isFinalWave,
   isWaveCleared,
   spawnWave,
@@ -103,7 +109,91 @@ interface IncomingWeaponFire {
   origin?: unknown;
   direction?: unknown;
   seq?: unknown;
+  slotIndex?: unknown;
+  spreadSeed?: unknown;
+  clientTime?: unknown;
 }
+
+/**
+ * Slot-index → weapon balance entry. Mirrors the order used by the duck's
+ * default loadout in apps/game/src/game/Inventory.js (`GUN_SLOTS`):
+ *   0 pistol, 1 shotgun, 2 rifle, 3 blaster, 4 dagger.
+ * Other character loadouts (sword/katana/spells) don't fire ranged weapons via
+ * the WeaponFire intent, so any slot they expose maps to `null` here. We keep
+ * a defensive default so a malformed slotIndex doesn't crash the room.
+ */
+const WEAPON_FOR_SLOT: ReadonlyArray<{
+  id: string;
+  damage: number;
+  range: number;
+  pellets: number;
+} | null> = [
+  // 0 — pistol
+  {
+    id: "pistol",
+    damage: WEAPON_BALANCE.pistol.damage,
+    range: WEAPON_BALANCE.pistol.range,
+    pellets: WEAPON_BALANCE.pistol.pellets,
+  },
+  // 1 — shotgun
+  {
+    id: "shotgun",
+    damage: WEAPON_BALANCE.shotgun.damage,
+    range: WEAPON_BALANCE.shotgun.range,
+    pellets: WEAPON_BALANCE.shotgun.pellets,
+  },
+  // 2 — rifle
+  {
+    id: "rifle",
+    damage: WEAPON_BALANCE.rifle.damage,
+    range: WEAPON_BALANCE.rifle.range,
+    pellets: WEAPON_BALANCE.rifle.pellets,
+  },
+  // 3 — blaster (penetrating)
+  {
+    id: "blaster",
+    damage: WEAPON_BALANCE.blaster.damage,
+    range: WEAPON_BALANCE.blaster.range,
+    pellets: WEAPON_BALANCE.blaster.pellets,
+  },
+  // 4 — dagger (projectile, but server uses hitscan resolve)
+  {
+    id: "dagger",
+    damage: WEAPON_BALANCE.dagger.damage,
+    range: WEAPON_BALANCE.dagger.range,
+    pellets: WEAPON_BALANCE.dagger.pellets,
+  },
+];
+
+/**
+ * Sample row in the lag-compensation ring buffer. Captures every entity's
+ * authoritative position so a fire intent dated `t` can be resolved against
+ * "what the shooter actually saw".
+ */
+interface HistorySample {
+  /** Date.now() at which this row was captured. */
+  t: number;
+  enemies: Map<string, { x: number; y: number; z: number }>;
+  dragons: Map<string, { x: number; y: number; z: number }>;
+  players: Map<string, { x: number; y: number; z: number }>;
+}
+
+/** Snapshot one entry every ~50ms. */
+const HISTORY_SAMPLE_INTERVAL_MS = 50;
+/** Maximum number of entries kept (≥ LAG_COMPENSATION_WINDOW_MS / interval). */
+const HISTORY_MAX_SAMPLES = Math.ceil(
+  LAG_COMPENSATION_WINDOW_MS / HISTORY_SAMPLE_INTERVAL_MS,
+) + 1;
+/** Reject fire intents whose clientTime is older than this. */
+const MAX_FIRE_INTENT_AGE_MS = 500;
+
+/** Bounding sphere radii used for hitscan against enemies/dragons/players. */
+const ENEMY_HIT_RADIUS = 0.9;
+const DRAGON_HIT_RADIUS = 2.0;
+const PLAYER_HIT_RADIUS = 0.75;
+const ENEMY_HIT_CENTER_Y = 1.0; // torso offset above feet
+const DRAGON_HIT_CENTER_Y = 0.0; // dragon Y already at body center
+const PLAYER_HIT_CENTER_Y = 1.0;
 
 interface IncomingLobbyStart {
   countdownMs?: unknown;
@@ -163,10 +253,89 @@ export class GameRoom extends Room<GameState> {
   private dragonOrbitPhase = new Map<string, number>();
 
   /**
+   * Per-boss AI state. The wave-5 miniboss runs a different cycle than the
+   * regular dragons (ground balls, homing bolts, machine-gun burst); we keep
+   * a separate map so the schema stays lean and so we can lazily seed the
+   * timer when a boss first appears.
+   */
+  private bossState = new Map<
+    string,
+    {
+      attackTimer: number;
+      lastAttack: "ground" | "homing" | "machinegun" | null;
+      burstLeft: number;
+      burstInterval: number;
+    }
+  >();
+
+  /**
+   * If the room is mid-cinematic, this is the Date.now() at which the
+   * scripted phase ends. 0 means we are not in a cinematic. While set, the
+   * normal wave-progression / spawn loop is suppressed.
+   */
+  private cinematicEndsAt = 0;
+  private cinematicWave = 0;
+
+  /**
+   * Live boss projectiles (ground balls, homing bolts, machine-gun bullets).
+   * Not synced via Colyseus schema — the client renders them from the
+   * `boss:*` EnemyEvent broadcasts. Damage stays authoritative: each tick we
+   * advance these and test against player hitboxes.
+   */
+  private bossProjectiles: {
+    kind: "ground" | "homing" | "bullet";
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+    /** Cached ground impact altitude for `ground` balls. */
+    targetY: number;
+    life: number;
+    damage: number;
+    radius: number;
+    /** Only used by `homing`: per-second turn-toward-player rate. */
+    turn: number;
+    speed: number;
+  }[] = [];
+
+  /**
+   * Active boss-laid fire zones (left behind after a ground ball lands). They
+   * deal damage in pulses and time out after {@link BOSS_BALANCE.ground.zoneTtl}
+   * seconds.
+   */
+  private bossFireZones: {
+    x: number;
+    y: number;
+    z: number;
+    radius: number;
+    dps: number;
+    ttl: number;
+    age: number;
+    /** Time until the next damage pulse fires. */
+    nextTick: number;
+    tickRate: number;
+  }[] = [];
+
+  /**
    * Cached player views, refreshed once per tick. Hands a stable array to
    * the AI ticks so they don't re-walk the MapSchema per-enemy.
    */
   private playerViewsCache: { x: number; y: number; z: number; alive: boolean }[] = [];
+
+  /**
+   * Lag-compensation ring buffer. Holds up to
+   * {@link HISTORY_MAX_SAMPLES} authoritative position snapshots (newest last).
+   * Refreshed every {@link HISTORY_SAMPLE_INTERVAL_MS}. The buffer is consulted
+   * by {@link handleWeaponFire} to rewind world state to the moment the shooter
+   * actually saw the world (clientTime − estimatedLag).
+   */
+  private history: HistorySample[] = [];
+  private lastHistorySampleAt = 0;
+
+  /** Monotonic shot id for WeaponHit / WeaponMiss broadcasts. */
+  private nextShotSeq = 1;
 
   maxClients = MAX_PLAYERS_PER_ROOM;
 
@@ -462,16 +631,210 @@ export class GameRoom extends Room<GameState> {
   }
 
   /**
-   * Stub. Phase 5 lands lag-compensated ray resolution; for now we always
-   * answer with a Miss so the client UX keeps animating.
+   * Lag-compensated weapon fire pipeline.
+   *
+   *   1. Validate slotIndex, origin/direction, clientTime freshness.
+   *   2. Estimate the shooter's lag (server_now − clientTime, clamped to the
+   *      compensation window) and rewind world state to that instant by
+   *      picking the closest historical sample.
+   *   3. Sphere-cast against every enemy/dragon/player in that snapshot;
+   *      pick the closest hit inside the weapon's range.
+   *   4. Broadcast WeaponHit (with damage) or WeaponMiss back to all
+   *      clients so they can play impact effects / flashes on the right id.
+   *      Damage / death / coins are routed through {@link applyDamage}, which
+   *      already emits vs:damage and vs:coins on its own.
+   *
+   * Ranged enemy projectiles (witch/skeleton/dragon) are handled elsewhere.
+   * This handler is the player-fired hitscan path only.
    */
   private handleWeaponFire(
     client: Client,
     raw: IncomingWeaponFire,
   ): void {
+    const shooter = this.state.players.get(client.sessionId);
+    if (!shooter || !shooter.alive || !shooter.connected) return;
+    if (this.state.phase !== "playing") return;
     if (!raw || typeof raw !== "object") return;
+
     const seq = typeof raw.seq === "number" ? raw.seq : 0;
-    client.send(VoxelServerMessage.WeaponMiss, { seq });
+    const shotId = `s${this.nextShotSeq++}`;
+
+    // ── slotIndex → weapon entry ───────────────────────────────────────────
+    const slotIndex = toInt(raw.slotIndex);
+    if (slotIndex === null || slotIndex < 0 || slotIndex >= WEAPON_FOR_SLOT.length) {
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+    const weapon = WEAPON_FOR_SLOT[slotIndex];
+    if (!weapon) {
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+
+    // ── origin / direction sanity ──────────────────────────────────────────
+    const origin = toVec3(raw.origin);
+    const direction = toVec3(raw.direction);
+    if (!origin || !direction) {
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+    // Normalize direction (reject zero-length).
+    const dirLen = Math.hypot(direction[0], direction[1], direction[2]);
+    if (dirLen < 1e-4) {
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+    const ndx = direction[0] / dirLen;
+    const ndy = direction[1] / dirLen;
+    const ndz = direction[2] / dirLen;
+
+    // Reject shots whose origin is wildly far from the shooter's authoritative
+    // position. This is a cheap cheat-guard, not a precise eye-position check.
+    const oDx = origin[0] - shooter.x;
+    const oDy = origin[1] - shooter.y;
+    const oDz = origin[2] - shooter.z;
+    if (oDx * oDx + oDy * oDy + oDz * oDz > 9 * 9) {
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+
+    // ── clientTime freshness ───────────────────────────────────────────────
+    const clientTime =
+      typeof raw.clientTime === "number" && Number.isFinite(raw.clientTime)
+        ? raw.clientTime
+        : 0;
+    const now = Date.now();
+    if (clientTime > 0 && now - clientTime > MAX_FIRE_INTENT_AGE_MS) {
+      // Stale intent — most likely the client paused or the socket queued.
+      client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+
+    // ── lag compensation ───────────────────────────────────────────────────
+    // estimatedLag := server_now − clientTime, clamped to the window.
+    let estimatedLag = clientTime > 0 ? now - clientTime : 0;
+    if (estimatedLag < 0) estimatedLag = 0;
+    if (estimatedLag > LAG_COMPENSATION_WINDOW_MS) {
+      estimatedLag = LAG_COMPENSATION_WINDOW_MS;
+    }
+    const targetTime = now - estimatedLag;
+    const snapshot = this.pickHistorySample(targetTime);
+
+    // ── raycast against the rewound snapshot ───────────────────────────────
+    const hit = this.resolveWeaponHit(
+      origin,
+      [ndx, ndy, ndz],
+      weapon.range,
+      snapshot,
+      client.sessionId,
+    );
+
+    if (!hit) {
+      this.broadcast(VoxelServerMessage.WeaponMiss, { seq, shotId });
+      return;
+    }
+
+    // Apply damage. applyDamage already broadcasts vs:damage on non-killing
+    // hits, vs:enemyDespawn + vs:coins on kills.
+    this.applyDamage(hit.targetId, weapon.damage, client.sessionId);
+
+    this.broadcast(VoxelServerMessage.WeaponHit, {
+      seq,
+      shotId,
+      hits: [
+        {
+          targetId: hit.targetId,
+          damage: weapon.damage,
+          point: hit.point,
+        },
+      ],
+    });
+  }
+
+  /**
+   * Sphere-cast the shooter's ray against every enemy / dragon / player in
+   * the historical snapshot, returning the closest hit inside `range`.
+   *
+   * The snapshot is optional — if no history is available yet we fall back to
+   * the live state. Players don't get friendly-fired (shooter excluded).
+   * Dead entities (no longer in live state) are filtered out so a stale
+   * history sample can't re-kill a despawned target.
+   */
+  private resolveWeaponHit(
+    origin: [number, number, number],
+    direction: [number, number, number],
+    range: number,
+    snapshot: HistorySample | null,
+    shooterSessionId: string,
+  ): { targetId: string; point: [number, number, number] } | null {
+    const enemies = snapshot ? snapshot.enemies : this.mapEnemyPositions();
+    const dragons = snapshot ? snapshot.dragons : this.mapDragonPositions();
+    const players = snapshot ? snapshot.players : this.mapPlayerPositions();
+
+    let bestT = Infinity;
+    let bestTarget: string | null = null;
+    let bestPoint: [number, number, number] | null = null;
+
+    const check = (
+      id: string,
+      cx: number,
+      cy: number,
+      cz: number,
+      radius: number,
+      prefix: "enemy" | "dragon" | "player",
+    ): void => {
+      const t = raySphereT(origin, direction, [cx, cy, cz], radius);
+      if (t === null) return;
+      if (t > range) return;
+      if (t >= bestT) return;
+      bestT = t;
+      bestTarget = `${prefix}:${id}`;
+      bestPoint = [
+        origin[0] + direction[0] * t,
+        origin[1] + direction[1] * t,
+        origin[2] + direction[2] * t,
+      ];
+    };
+
+    enemies.forEach((pos, id) => {
+      if (!this.state.enemies.has(id)) return;
+      check(id, pos.x, pos.y + ENEMY_HIT_CENTER_Y, pos.z, ENEMY_HIT_RADIUS, "enemy");
+    });
+    dragons.forEach((pos, id) => {
+      if (!this.state.dragons.has(id)) return;
+      check(id, pos.x, pos.y + DRAGON_HIT_CENTER_Y, pos.z, DRAGON_HIT_RADIUS, "dragon");
+    });
+    players.forEach((pos, sid) => {
+      if (sid === shooterSessionId) return;
+      const live = this.state.players.get(sid);
+      if (!live || !live.alive || !live.connected) return;
+      check(sid, pos.x, pos.y + PLAYER_HIT_CENTER_Y, pos.z, PLAYER_HIT_RADIUS, "player");
+    });
+
+    if (!bestTarget || !bestPoint) return null;
+    return { targetId: bestTarget, point: bestPoint };
+  }
+
+  /** Snapshot live enemy positions when history isn't usable yet. */
+  private mapEnemyPositions(): Map<string, { x: number; y: number; z: number }> {
+    const out = new Map<string, { x: number; y: number; z: number }>();
+    this.state.enemies.forEach((e, id) => out.set(id, { x: e.x, y: e.y, z: e.z }));
+    return out;
+  }
+  /** Snapshot live dragon positions when history isn't usable yet. */
+  private mapDragonPositions(): Map<string, { x: number; y: number; z: number }> {
+    const out = new Map<string, { x: number; y: number; z: number }>();
+    this.state.dragons.forEach((d, id) => out.set(id, { x: d.x, y: d.y, z: d.z }));
+    return out;
+  }
+  /** Snapshot live player positions, filtering disconnected / dead ones. */
+  private mapPlayerPositions(): Map<string, { x: number; y: number; z: number }> {
+    const out = new Map<string, { x: number; y: number; z: number }>();
+    this.state.players.forEach((p, sid) => {
+      if (!p.alive || !p.connected) return;
+      out.set(sid, { x: p.x, y: p.y, z: p.z });
+    });
+    return out;
   }
 
   /** Stub. Phase 4 will manage ammo / cooldowns server-side. */
@@ -675,8 +1038,65 @@ export class GameRoom extends Room<GameState> {
       this.tickEnemies(dt);
       this.tickDragons(dt);
       this.tickFireballs(dt);
-      this.checkWaveProgression();
+      this.tickBossProjectiles(dt);
+      this.tickBossFireZones(dt);
+      // Mid-cinematic? When the timer expires, transition out and either spawn
+      // the next wave or end the run. While in flight, we still tick the
+      // boss-projectile cleanup above (in case wave 5 spilled into wave 10).
+      if (this.cinematicEndsAt !== 0 && Date.now() >= this.cinematicEndsAt) {
+        this.endCinematicWave();
+      } else {
+        this.checkWaveProgression();
+      }
     }
+    // Lag-compensation buffer: capture a snapshot at most every
+    // HISTORY_SAMPLE_INTERVAL_MS. Done last so the snapshot reflects the
+    // post-tick authoritative state.
+    this.maybeSampleHistory();
+  }
+
+  /**
+   * Push a historical snapshot of enemy / dragon / player positions onto the
+   * ring buffer if enough time has elapsed since the last sample. We only
+   * record the fields raycast resolution actually needs.
+   */
+  private maybeSampleHistory(): void {
+    const now = Date.now();
+    if (now - this.lastHistorySampleAt < HISTORY_SAMPLE_INTERVAL_MS) return;
+    this.lastHistorySampleAt = now;
+
+    const enemies = new Map<string, { x: number; y: number; z: number }>();
+    this.state.enemies.forEach((e, id) => {
+      enemies.set(id, { x: e.x, y: e.y, z: e.z });
+    });
+    const dragons = new Map<string, { x: number; y: number; z: number }>();
+    this.state.dragons.forEach((d, id) => {
+      dragons.set(id, { x: d.x, y: d.y, z: d.z });
+    });
+    const players = new Map<string, { x: number; y: number; z: number }>();
+    this.state.players.forEach((p, sid) => {
+      if (!p.alive || !p.connected) return;
+      players.set(sid, { x: p.x, y: p.y, z: p.z });
+    });
+
+    this.history.push({ t: now, enemies, dragons, players });
+    while (this.history.length > HISTORY_MAX_SAMPLES) this.history.shift();
+  }
+
+  /**
+   * Pick the historical sample closest to (and not after) `targetTime`. Falls
+   * back to the newest sample when the buffer is empty or the requested time
+   * is in the future. Returns null only when no samples exist.
+   */
+  private pickHistorySample(targetTime: number): HistorySample | null {
+    if (this.history.length === 0) return null;
+    // Walk newest → oldest so the first one ≤ targetTime wins.
+    for (let i = this.history.length - 1; i >= 0; i -= 1) {
+      const sample = this.history[i];
+      if (sample.t <= targetTime) return sample;
+    }
+    // Requested time is older than every sample — use the oldest we have.
+    return this.history[0];
   }
 
   /** Rebuild {@link playerViewsCache} from the current MapSchema. */
@@ -800,6 +1220,10 @@ export class GameRoom extends Room<GameState> {
    * Minimal dragon AI: orbit the origin at altitude, lob a fireball at the
    * nearest alive player every {@link DRAGON_BALANCE.attackCooldownMin}..max
    * seconds. Numeric ops only — no Vector3 allocation per tick.
+   *
+   * The wave-5 miniboss (dragon with `boss=true`) takes a different code path
+   * ({@link tickBossDragon}) and cycles ground / homing / machine-gun
+   * attacks instead of lobbing normal fireballs.
    */
   private tickDragons(dt: number): void {
     if (this.state.dragons.size === 0) return;
@@ -812,6 +1236,10 @@ export class GameRoom extends Room<GameState> {
     const cooldownMax = DRAGON_BALANCE.attackCooldownMax ?? 3.2;
 
     this.state.dragons.forEach((dragon, id) => {
+      if (dragon.boss) {
+        this.tickBossDragon(dragon, id, dt, players);
+        return;
+      }
       // Update orbit phase: ω = baseSpeed + aggression scaling.
       const omega =
         (DRAGON_BALANCE.baseSpeed ?? 0.24) +
@@ -908,6 +1336,88 @@ export class GameRoom extends Room<GameState> {
   }
 
   /**
+   * Wave-5 miniboss tick. Orbits at {@link BOSS_BALANCE.orbitRadius} and runs
+   * an authoritative attack cycle:
+   *   1. ground — slow fireballs that scorch zone hazards on landing.
+   *   2. homing — fast curving bolts.
+   *   3. machinegun — a tight burst of small bullets.
+   *
+   * For all three the server broadcasts an {@link VoxelServerMessage.EnemyEvent}
+   * (`boss:ground` / `boss:homing` / `boss:bullet`) so every client paints the
+   * same projectile trail. Damage stays authoritative — see
+   * {@link tickBossProjectiles}. Fire zones from `ground` impacts are
+   * simulated server-side too and broadcast as a "boss:zone" tick event.
+   */
+  private tickBossDragon(
+    dragon: import("../schema/DragonState.js").DragonState,
+    id: string,
+    dt: number,
+    players: { x: number; y: number; z: number; alive: boolean }[],
+  ): void {
+    // Orbit the centre at a fixed radius; faster than a regular dragon.
+    const omega = 0.55;
+    const phase = (this.dragonOrbitPhase.get(id) ?? 0) + omega * dt;
+    this.dragonOrbitPhase.set(id, phase);
+    const radius = BOSS_BALANCE.orbitRadius;
+    dragon.x = Math.cos(phase) * radius;
+    dragon.z = Math.sin(phase) * radius;
+
+    // Slight altitude bob.
+    const bobT = (this.state.tick / 20) * 2.5;
+    dragon.y = BOSS_BALANCE.altitude + Math.sin(bobT) * 1.2;
+    dragon.rotationY = Math.atan2(-Math.sin(phase), Math.cos(phase));
+
+    let st = this.bossState.get(id);
+    if (!st) {
+      st = {
+        attackTimer: 2.0,
+        lastAttack: null,
+        burstLeft: 0,
+        burstInterval: 0,
+      };
+      this.bossState.set(id, st);
+    }
+
+    // Machine-gun burst — fire one bullet per sub-interval until exhausted.
+    // Skips the normal attack-timer countdown.
+    if (st.burstLeft > 0) {
+      st.burstInterval -= dt;
+      if (st.burstInterval <= 0) {
+        this.fireBossBullet(dragon, players);
+        st.burstLeft -= 1;
+        st.burstInterval = BOSS_BALANCE.machinegun.interval;
+      }
+      return;
+    }
+
+    st.attackTimer -= dt;
+    if (st.attackTimer > 0) return;
+
+    // Choose any attack except the one we just used so it stays varied.
+    const choices: ("ground" | "homing" | "machinegun")[] = [];
+    for (const k of ["ground", "homing", "machinegun"] as const) {
+      if (k !== st.lastAttack) choices.push(k);
+    }
+    const attack = choices[Math.floor(this.rand() * choices.length)] ?? "homing";
+    st.lastAttack = attack;
+    const [lo, hi] = BOSS_BALANCE.attackEvery;
+    st.attackTimer = lo + this.rand() * Math.max(0, hi - lo);
+
+    if (attack === "ground") {
+      for (let i = 0; i < BOSS_BALANCE.ground.count; i += 1) {
+        this.fireBossGround(dragon, players, i);
+      }
+    } else if (attack === "homing") {
+      for (let i = 0; i < BOSS_BALANCE.homing.count; i += 1) {
+        this.fireBossHoming(dragon, players);
+      }
+    } else {
+      st.burstLeft = BOSS_BALANCE.machinegun.burst;
+      st.burstInterval = 0;
+    }
+  }
+
+  /**
    * Advance fireballs, decrement life, and despawn on player hit or expiry.
    * Player damage applied directly to {@link VoxelPlayer.health}; the Phase 5
    * hit pipeline will route this through a Damage broadcast.
@@ -990,12 +1500,317 @@ export class GameRoom extends Room<GameState> {
     }
   }
 
+  // ── Wave-5 miniboss authoritative attacks ──────────────────────────────────
+  //
+  // Each attack spawns one or more server-side projectiles in
+  // {@link bossProjectiles} (NOT synced via Colyseus), and broadcasts an
+  // EnemyEvent so every client paints the same projectile. Damage is dealt
+  // when the server-side projectile collides with a player or terrain.
+
+  private nearestAlivePlayer(
+    origin: { x: number; y: number; z: number },
+    players: { x: number; y: number; z: number; alive: boolean }[],
+  ): { x: number; y: number; z: number } | null {
+    let best: { x: number; y: number; z: number } | null = null;
+    let bestDistSq = Infinity;
+    for (const p of players) {
+      if (!p.alive) continue;
+      const dx = p.x - origin.x;
+      const dy = p.y - origin.y;
+      const dz = p.z - origin.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bestDistSq) {
+        bestDistSq = d2;
+        best = { x: p.x, y: p.y, z: p.z };
+      }
+    }
+    return best;
+  }
+
+  private fireBossGround(
+    dragon: import("../schema/DragonState.js").DragonState,
+    players: { x: number; y: number; z: number; alive: boolean }[],
+    i: number,
+  ): void {
+    const target = this.nearestAlivePlayer({ x: dragon.x, y: dragon.y, z: dragon.z }, players);
+    if (!target) return;
+    const cfg = BOSS_BALANCE.ground;
+    const tx = target.x + (this.rand() - 0.5) * 5 + i * 1.6;
+    const tz = target.z + (this.rand() - 0.5) * 5;
+    // The server doesn't know terrain height (Phase 3 lands the procedural
+    // base). Default to PLAYER_SPAWN_Y like every other entity height.
+    const ty = PLAYER_SPAWN_Y - 0.5;
+    const dx = tx - dragon.x;
+    const dy = ty - dragon.y;
+    const dz = tz - dragon.z;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-4) return;
+    const speed = cfg.speed;
+    const vx = (dx / len) * speed;
+    const vy = (dy / len) * speed;
+    const vz = (dz / len) * speed;
+    this.bossProjectiles.push({
+      kind: "ground",
+      x: dragon.x,
+      y: dragon.y,
+      z: dragon.z,
+      vx,
+      vy,
+      vz,
+      targetY: ty,
+      life: 5,
+      damage: cfg.damage,
+      radius: 1.3,
+      turn: 0,
+      speed,
+    });
+    this.broadcast(VoxelServerMessage.EnemyEvent, {
+      enemyId: dragon.id,
+      event: "boss:ground",
+      origin: [dragon.x, dragon.y, dragon.z],
+      target: [tx, ty, tz],
+    });
+  }
+
+  private fireBossHoming(
+    dragon: import("../schema/DragonState.js").DragonState,
+    players: { x: number; y: number; z: number; alive: boolean }[],
+  ): void {
+    const target = this.nearestAlivePlayer({ x: dragon.x, y: dragon.y, z: dragon.z }, players);
+    if (!target) return;
+    const cfg = BOSS_BALANCE.homing;
+    let dx = target.x - dragon.x;
+    let dy = target.y + 1.2 - dragon.y;
+    let dz = target.z - dragon.z;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-4) return;
+    dx /= len; dy /= len; dz /= len;
+    // Spread.
+    dx += (this.rand() - 0.5) * 0.25;
+    dy += (this.rand() - 0.5) * 0.15;
+    dz += (this.rand() - 0.5) * 0.25;
+    const l2 = Math.hypot(dx, dy, dz) || 1;
+    dx /= l2; dy /= l2; dz /= l2;
+    const speed = cfg.speed;
+    this.bossProjectiles.push({
+      kind: "homing",
+      x: dragon.x,
+      y: dragon.y,
+      z: dragon.z,
+      vx: dx * speed,
+      vy: dy * speed,
+      vz: dz * speed,
+      targetY: 0,
+      life: cfg.life,
+      damage: cfg.damage,
+      radius: cfg.radius,
+      turn: cfg.turn,
+      speed,
+    });
+    this.broadcast(VoxelServerMessage.EnemyEvent, {
+      enemyId: dragon.id,
+      event: "boss:homing",
+      origin: [dragon.x, dragon.y, dragon.z],
+      target: [target.x, target.y + 1.2, target.z],
+    });
+  }
+
+  private fireBossBullet(
+    dragon: import("../schema/DragonState.js").DragonState,
+    players: { x: number; y: number; z: number; alive: boolean }[],
+  ): void {
+    const target = this.nearestAlivePlayer({ x: dragon.x, y: dragon.y, z: dragon.z }, players);
+    if (!target) return;
+    const cfg = BOSS_BALANCE.machinegun;
+    let dx = target.x - dragon.x;
+    let dy = target.y + 1.2 - dragon.y;
+    let dz = target.z - dragon.z;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-4) return;
+    dx /= len; dy /= len; dz /= len;
+    dx += (this.rand() - 0.5) * cfg.spread;
+    dy += (this.rand() - 0.5) * cfg.spread;
+    dz += (this.rand() - 0.5) * cfg.spread;
+    const l2 = Math.hypot(dx, dy, dz) || 1;
+    dx /= l2; dy /= l2; dz /= l2;
+    const speed = cfg.speed;
+    this.bossProjectiles.push({
+      kind: "bullet",
+      x: dragon.x,
+      y: dragon.y,
+      z: dragon.z,
+      vx: dx * speed,
+      vy: dy * speed,
+      vz: dz * speed,
+      targetY: 0,
+      life: cfg.life,
+      damage: cfg.damage,
+      radius: cfg.radius,
+      turn: 0,
+      speed,
+    });
+    this.broadcast(VoxelServerMessage.EnemyEvent, {
+      enemyId: dragon.id,
+      event: "boss:bullet",
+      origin: [dragon.x, dragon.y, dragon.z],
+      target: [target.x, target.y + 1.2, target.z],
+    });
+  }
+
+  /**
+   * Step every active boss projectile, check collisions, spawn fire zones on
+   * ground impacts, and resolve damage server-side. Damage on hit is sent
+   * through the regular {@link VoxelServerMessage.Damage} broadcast so the
+   * HUD reacts the same as a fireball hit.
+   */
+  private tickBossProjectiles(dt: number): void {
+    if (this.bossProjectiles.length === 0) return;
+    const players = this.state.players;
+    // Walk back-to-front so splices don't shuffle the index.
+    for (let i = this.bossProjectiles.length - 1; i >= 0; i -= 1) {
+      const p = this.bossProjectiles[i];
+      p.life -= dt;
+
+      if (p.kind === "homing") {
+        // Bias velocity toward the nearest alive player.
+        let targetX = 0;
+        let targetY = 0;
+        let targetZ = 0;
+        let haveTarget = false;
+        let bestD = Infinity;
+        players.forEach((pl) => {
+          if (!pl.alive || !pl.connected) return;
+          const dx = pl.x - p.x;
+          const dy = pl.y + 1.2 - p.y;
+          const dz = pl.z - p.z;
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < bestD) {
+            bestD = d2;
+            targetX = pl.x;
+            targetY = pl.y + 1.2;
+            targetZ = pl.z;
+            haveTarget = true;
+          }
+        });
+        if (haveTarget) {
+          const dx = targetX - p.x;
+          const dy = targetY - p.y;
+          const dz = targetZ - p.z;
+          const len = Math.hypot(dx, dy, dz) || 1;
+          const desiredVx = (dx / len) * p.speed;
+          const desiredVy = (dy / len) * p.speed;
+          const desiredVz = (dz / len) * p.speed;
+          const a = Math.min(1, dt * p.turn);
+          p.vx = p.vx + (desiredVx - p.vx) * a;
+          p.vy = p.vy + (desiredVy - p.vy) * a;
+          p.vz = p.vz + (desiredVz - p.vz) * a;
+        }
+      }
+
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+
+      let hit = false;
+      // Player hit test.
+      players.forEach((pl) => {
+        if (hit) return;
+        if (!pl.alive || !pl.connected) return;
+        const dx = pl.x - p.x;
+        const dy = pl.y + 1.0 - p.y;
+        const dz = pl.z - p.z;
+        const r = p.radius + 0.6;
+        if (dx * dx + dy * dy + dz * dz <= r * r) {
+          hit = true;
+          this.dealBossDamage(pl, p.damage);
+        }
+      });
+
+      const groundHit = p.kind === "ground" && p.y <= p.targetY;
+      if (groundHit) {
+        this.spawnBossFireZone(p.x, p.targetY, p.z);
+      }
+
+      if (hit || groundHit || p.life <= 0 || p.y < -4) {
+        this.bossProjectiles.splice(i, 1);
+      }
+    }
+  }
+
+  private dealBossDamage(pl: VoxelPlayer, dmg: number): void {
+    let remain = dmg;
+    if (pl.shield > 0) {
+      const absorbed = Math.min(pl.shield, remain);
+      pl.shield -= absorbed;
+      remain -= absorbed;
+    }
+    if (remain > 0) pl.health = Math.max(0, pl.health - remain);
+    if (pl.health <= 0 && pl.alive) {
+      pl.alive = false;
+      this.broadcast(VoxelServerMessage.PlayerDeath, { sessionId: pl.id });
+    } else {
+      this.broadcast(VoxelServerMessage.Damage, {
+        victimId: `player:${pl.id}`,
+        amount: dmg,
+        hp: pl.health,
+        shield: pl.shield,
+      });
+    }
+  }
+
+  private spawnBossFireZone(x: number, y: number, z: number): void {
+    const cfg = BOSS_BALANCE.ground;
+    this.bossFireZones.push({
+      x,
+      y,
+      z,
+      radius: cfg.zoneRadius,
+      dps: cfg.zoneDps,
+      ttl: cfg.zoneTtl,
+      age: 0,
+      nextTick: cfg.tickRate,
+      tickRate: cfg.tickRate,
+    });
+    this.broadcast(VoxelServerMessage.EnemyEvent, {
+      enemyId: "boss",
+      event: "boss:ground",
+      origin: [x, y, z],
+      target: [x, y, z],
+    });
+  }
+
+  private tickBossFireZones(dt: number): void {
+    if (this.bossFireZones.length === 0) return;
+    const players = this.state.players;
+    for (let i = this.bossFireZones.length - 1; i >= 0; i -= 1) {
+      const z = this.bossFireZones[i];
+      z.age += dt;
+      z.nextTick -= dt;
+      if (z.nextTick <= 0) {
+        // Pulse damage everyone standing inside.
+        const r2 = z.radius * z.radius;
+        const pulse = z.dps * z.tickRate;
+        players.forEach((pl) => {
+          if (!pl.alive || !pl.connected) return;
+          const dx = pl.x - z.x;
+          const dz = pl.z - z.z;
+          if (dx * dx + dz * dz <= r2) this.dealBossDamage(pl, pulse);
+        });
+        z.nextTick = z.tickRate;
+      }
+      if (z.age >= z.ttl) this.bossFireZones.splice(i, 1);
+    }
+  }
+
   /**
    * If the current wave is cleared, advance to the next wave or end the run.
-   * Only fires while `phase === 'playing'`.
+   * Only fires while `phase === 'playing'`. Skips entirely while a cinematic
+   * is in flight ({@link cinematicEndsAt} != 0) — the tick loop handles the
+   * cinematic exit explicitly.
    */
   private checkWaveProgression(): void {
     if (this.state.phase !== "playing") return;
+    if (this.cinematicEndsAt !== 0) return;
     if (!isWaveCleared(this.state)) return;
 
     // Wave just finished. If this was the last wave, broadcast WaveEnd and
@@ -1012,16 +1827,45 @@ export class GameRoom extends Room<GameState> {
 
     const next = (this.state.wave + 1) & 0xffff;
     this.state.wave = next;
-    this.broadcast(VoxelServerMessage.WaveStart, {
-      wave: next,
-      totalWaves: this.state.totalWaves,
-    });
+    this.broadcastWaveStart(next);
     this.spawnCurrentWave();
   }
 
-  /** Spawn enemies for `state.wave` and broadcast an EnemySpawn snapshot. */
+  /**
+   * Broadcast a {@link VoxelServerMessage.WaveStart} payload, decorating it
+   * with `boss` / `cinematic` flags so clients know to render the special
+   * wave intros (miniboss toast on wave 5, meteor cinematic on wave 10).
+   */
+  private broadcastWaveStart(wave: number): void {
+    const payload: {
+      wave: number;
+      totalWaves: number;
+      boss?: boolean;
+      cinematic?: boolean;
+    } = {
+      wave,
+      totalWaves: this.state.totalWaves,
+    };
+    if (isBossWave(wave)) payload.boss = true;
+    if (isCinematicWave(wave)) payload.cinematic = true;
+    this.broadcast(VoxelServerMessage.WaveStart, payload);
+  }
+
+  /**
+   * Spawn enemies for `state.wave` and broadcast an EnemySpawn snapshot. For
+   * the cinematic wave (10 by default), instead of spawning enemies we trigger
+   * the meteor scene: a WaveCinematic broadcast, world deltas for the crater,
+   * and a timer that flips the room back to normal wave play after
+   * {@link METEOR_BALANCE.duration} seconds.
+   */
   private spawnCurrentWave(): void {
     const wave = this.state.wave || 1;
+
+    if (isCinematicWave(wave)) {
+      this.startCinematicWave(wave);
+      return;
+    }
+
     const ids = spawnWave(this.state, wave, this.rand);
 
     // Optional EnemySpawn snapshot — clients receive enemies via schema sync,
@@ -1073,6 +1917,111 @@ export class GameRoom extends Room<GameState> {
         z: snap.z,
       });
     }
+  }
+
+  /**
+   * Enter wave-10 meteor cinematic. Clears any lingering enemies / boss
+   * projectiles, broadcasts a {@link VoxelServerMessage.WaveCinematic}, and
+   * carves a crater (world deltas broadcast through the existing WorldDelta
+   * channel). The room stays in 'playing' phase so EnemySync etc. keep
+   * receiving updates; {@link update} flips back to normal play once
+   * {@link cinematicEndsAt} elapses.
+   */
+  private startCinematicWave(wave: number): void {
+    // Clear any leftover state so the next "real" wave starts clean.
+    this.state.enemies.clear();
+    this.state.dragons.clear();
+    this.state.fireballs.clear();
+    this.dragonFireCooldown.clear();
+    this.dragonOrbitPhase.clear();
+    this.bossState.clear();
+    this.bossProjectiles.length = 0;
+    this.bossFireZones.length = 0;
+
+    this.cinematicWave = wave;
+    this.cinematicEndsAt = Date.now() + Math.max(500, METEOR_BALANCE.duration * 1000);
+
+    this.broadcast(VoxelServerMessage.WaveCinematic, {
+      wave,
+      kind: "meteor",
+      duration: METEOR_BALANCE.duration,
+    });
+
+    // Carve the crater. Each affected cell is broadcast as a WorldDelta so
+    // every client converges on the same map state. The math mirrors
+    // World.carveCrater (apps/game/src/engine/World.js).
+    this.carveServerCrater(0, 0, METEOR_BALANCE.craterRadius);
+
+    console.log(
+      `[GameRoom ${this.state.roomCode}] wave=${wave} cinematic=meteor duration=${METEOR_BALANCE.duration}s`,
+    );
+    debugLog(this.state.roomCode, "wave:cinematic", {
+      wave,
+      kind: "meteor",
+    });
+  }
+
+  /**
+   * Server-side crater dig. Walks every cell within `radius` and marks it as
+   * removed in the world delta map, broadcasting a WorldDelta for each. The
+   * client's World.carveCrater also rebuilds terrain in a bowl shape; the
+   * server is content with "the column is gone" because the procedural base
+   * (Phase 3) will land later and the dimples are the visual touch.
+   */
+  private carveServerCrater(cx: number, cz: number, radius: number): void {
+    const r2 = radius * radius;
+    for (let dx = -radius; dx <= radius; dx += 1) {
+      for (let dz = -radius; dz <= radius; dz += 1) {
+        if (dx * dx + dz * dz > r2) continue;
+        const x = cx + dx;
+        const z = cz + dz;
+        // Wipe the whole column up to the water level + a little margin so
+        // the crater is visible regardless of what the procedural base laid
+        // down underneath.
+        const top = (this.state.world.waterLevel ?? 6) + 4;
+        for (let y = 0; y <= top; y += 1) {
+          const key = `${x},${y},${z}`;
+          if (this.state.world.deltas.get(key) === 0) continue;
+          this.state.world.deltas.set(key, 0);
+          this.state.world.deltaSeq = (this.state.world.deltaSeq + 1) >>> 0;
+          this.broadcast(VoxelServerMessage.WorldDelta, {
+            op: "mine",
+            x,
+            y,
+            z,
+            t: 0,
+            seq: this.state.world.deltaSeq,
+            by: null,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Called from {@link update} once {@link cinematicEndsAt} elapses. Treats
+   * the cinematic wave as "cleared" and either ends the run (if it was the
+   * final wave) or advances to the next.
+   */
+  private endCinematicWave(): void {
+    const wave = this.cinematicWave;
+    this.cinematicEndsAt = 0;
+    this.cinematicWave = 0;
+
+    if (isFinalWave(wave)) {
+      this.state.phase = "dead";
+      this.broadcast(VoxelServerMessage.WaveEnd, {
+        wave,
+        runComplete: true,
+        victory: true,
+      });
+      return;
+    }
+
+    const next = (wave + 1) & 0xffff;
+    this.state.wave = next;
+    this.broadcastWaveStart(next);
+    this.spawnCurrentWave();
   }
 
   /**
@@ -1150,6 +2099,7 @@ export class GameRoom extends Room<GameState> {
     this.state.dragons.delete(id);
     this.dragonFireCooldown.delete(id);
     this.dragonOrbitPhase.delete(id);
+    this.bossState.delete(id);
     this.broadcast(VoxelServerMessage.EnemyDespawn, { enemyId: id });
     this.awardCoins(attackerSessionId, COINS_BALANCE.dragon ?? 5);
     return true;
@@ -1176,6 +2126,11 @@ export class GameRoom extends Room<GameState> {
     this.state.fireballs.clear();
     this.dragonFireCooldown.clear();
     this.dragonOrbitPhase.clear();
+    this.bossState.clear();
+    this.bossProjectiles.length = 0;
+    this.bossFireZones.length = 0;
+    this.cinematicEndsAt = 0;
+    this.cinematicWave = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -1238,10 +2193,12 @@ export class GameRoom extends Room<GameState> {
     }
 
     this.state.phase = "playing";
-    this.broadcast(VoxelServerMessage.WaveStart, {
-      wave: this.state.wave,
-      totalWaves: this.state.totalWaves,
-    });
+    this.broadcastWaveStart(this.state.wave);
+    // If the shop-end path lands on the cinematic wave (e.g. 9 → 10), still
+    // route through spawnCurrentWave so the meteor cinematic actually fires.
+    if (isCinematicWave(this.state.wave)) {
+      this.spawnCurrentWave();
+    }
   }
 
   /**
@@ -1336,10 +2293,7 @@ export class GameRoom extends Room<GameState> {
       // Reset any leftover entities (e.g. host re-started after a dead run)
       // and spawn wave 1.
       this.clearWaveEntities();
-      this.broadcast(VoxelServerMessage.WaveStart, {
-        wave: 1,
-        totalWaves: this.state.totalWaves,
-      });
+      this.broadcastWaveStart(1);
       this.spawnCurrentWave();
     }
   }
@@ -1348,6 +2302,63 @@ export class GameRoom extends Room<GameState> {
 function toInt(v: unknown): number | null {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
   return Math.trunc(v);
+}
+
+/**
+ * Validate and coerce a `[x,y,z]` triple incoming from the wire. Accepts both
+ * the protocol's tuple shape and a fall-back `{x,y,z}` object. Returns null on
+ * any non-finite component.
+ */
+function toVec3(v: unknown): [number, number, number] | null {
+  if (Array.isArray(v) && v.length >= 3) {
+    const x = Number(v[0]);
+    const y = Number(v[1]);
+    const z = Number(v[2]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      return null;
+    }
+    return [x, y, z];
+  }
+  if (v && typeof v === "object") {
+    const o = v as { x?: unknown; y?: unknown; z?: unknown };
+    const x = Number(o.x);
+    const y = Number(o.y);
+    const z = Number(o.z);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      return null;
+    }
+    return [x, y, z];
+  }
+  return null;
+}
+
+/**
+ * Ray-sphere intersection: returns the distance from `origin` along the
+ * (unit-length) `dir` to the nearest hit, or `null` if no hit. Used by the
+ * WeaponFire pipeline as a cheap bounding-sphere collider. The first
+ * intersection in front of the origin wins; if the origin is inside the
+ * sphere we return 0.
+ */
+function raySphereT(
+  origin: [number, number, number],
+  dir: [number, number, number],
+  center: [number, number, number],
+  radius: number,
+): number | null {
+  const ox = origin[0] - center[0];
+  const oy = origin[1] - center[1];
+  const oz = origin[2] - center[2];
+  const b = ox * dir[0] + oy * dir[1] + oz * dir[2];
+  const c = ox * ox + oy * oy + oz * oz - radius * radius;
+  if (c > 0 && b > 0) return null;
+  const disc = b * b - c;
+  if (disc < 0) return null;
+  const sqrtDisc = Math.sqrt(disc);
+  const t1 = -b - sqrtDisc;
+  if (t1 >= 0) return t1;
+  const t2 = -b + sqrtDisc;
+  if (t2 >= 0) return 0; // origin inside the sphere
+  return null;
 }
 
 function coinsForKind(kind: string): number {

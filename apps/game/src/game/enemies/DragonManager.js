@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { _flashEntityMeshShared } from './ZombieManager.js';
+import { BALANCE } from '../../core/config/GameBalance.js';
 
 const DEFAULT_DRAGON_COUNT = 3;
 const FIREBALL_COLLISION_RADIUS = 1.15;
@@ -107,6 +109,16 @@ export class DragonManager {
     // to pure snapshot interpolation. Default 'local'.
     this._authority = 'local';
     this._serverEntities = new Map();
+    // Visual-only fireballs spawned by server dragonFireball events. Keyed by
+    // the server fireball id so reflect/despawn events route to the right
+    // mesh. Position is integrated locally using the velocity baked into the
+    // spawn payload — the server's own life timer governs the despawn event.
+    this._serverFireballs = new Map();
+    // Visual-only wave-5 miniboss projectiles spawned from EnemyEvent
+    // broadcasts (boss:ground / boss:homing / boss:bullet). The server still
+    // owns damage and lifetime; these meshes are purely cosmetic and fade out
+    // when their own short life timer expires.
+    this._serverBossProjectiles = [];
 
     this.count = options.count ?? DEFAULT_DRAGON_COUNT;
     this.origin = options.origin?.isVector3 ? options.origin.clone() : new THREE.Vector3(0, 0, 0);
@@ -450,10 +462,10 @@ export class DragonManager {
     const dt = Math.min(delta || 0, 0.08);
     this.elapsed += dt;
 
-    // Server-authoritative mode: no orbit AI, no fireballs, no health bars.
-    // Just interpolate every server-owned dragon mesh toward its newest snap.
-    // (Health-bar/fireball visuals will return when the dedicated dragon
-    // schema fields and the dragonFireball event pipeline land.)
+    // Server-authoritative mode: no orbit AI, no health bars. Just interpolate
+    // every server-owned dragon mesh toward its newest snap and let any
+    // server-spawned fireballs / boss projectiles drift forward by their
+    // broadcast velocity.
     if (this._authority === 'server') {
       const now = performance.now();
       // Bugfix: server dragons live in _serverEntities, not in this.dragons.
@@ -461,6 +473,8 @@ export class DragonManager {
         if (dragon.dead || !dragon.serverOwned) continue;
         _interpServerDragon(dragon, now);
       }
+      this._updateServerFireballs(dt);
+      this._updateServerBossProjectiles(dt);
       return;
     }
 
@@ -1093,23 +1107,44 @@ export class DragonManager {
       this.fireballs.length = 0;
     } else {
       this.clearServerEntities();
+      this._clearServerFireballs();
+      this._clearServerBossProjectiles();
     }
+  }
+
+  _clearServerFireballs() {
+    for (const entry of this._serverFireballs.values()) {
+      this.group.remove(entry.mesh);
+    }
+    this._serverFireballs.clear();
   }
 
   /**
    * Upsert a server-broadcast dragon. The first call spawns the visual; later
    * calls push to its interpolation buffer.
+   *
+   * If `snap.boss` is true we mint a boss mesh (red tint + 1.9x scale) and
+   * stamp `dragon.boss = true` so the rendering loop can also handle the
+   * larger health bar / hit feedback if/when that's added.
    */
   applyServerDragon(snap) {
     if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
     let dragon = this._serverEntities.get(snap.id);
     if (!dragon) {
-      const mesh = this.createDragonMesh(this._serverEntities.size);
+      const isBoss = snap.boss === true;
+      // Boss mesh: bigger red tinted dragon. createBossMesh expects the
+      // miniboss config from GameBalance; we read it from the singleplayer
+      // BALANCE constant so the look matches whatever the host configured.
+      const bossCfg = isBoss ? (BALANCE?.boss ?? null) : null;
+      const mesh = isBoss && bossCfg
+        ? this.createBossMesh(bossCfg)
+        : this.createDragonMesh(this._serverEntities.size);
       mesh.position.set(snap.x, snap.y, snap.z);
       mesh.rotation.y = snap.rotationY ?? 0;
       dragon = {
         id: snap.id,
         serverOwned: true,
+        boss: isBoss,
         health: snap.health ?? 100,
         maxHealth: snap.maxHealth ?? 100,
         mesh,
@@ -1124,6 +1159,19 @@ export class DragonManager {
       this.group.add(mesh);
       this.dragons.push(dragon);
       this._serverEntities.set(snap.id, dragon);
+      if (isBoss && bossCfg) {
+        // Cache the boss config so server-driven boss events (boss:ground/
+        // boss:homing/boss:bullet) can spawn the right-coloured projectile.
+        this.bossConfig = bossCfg;
+        // Mint the projectile materials lazily — the same ones spawnBoss()
+        // creates in singleplayer.
+        this.material.bossBall = this.material.bossBall
+          || new THREE.MeshStandardMaterial({ color: bossCfg.fire, emissive: bossCfg.fire, emissiveIntensity: 1.6, roughness: 0.5, flatShading: true });
+        this.material.bossBolt = this.material.bossBolt
+          || new THREE.MeshStandardMaterial({ color: 0xff7a2a, emissive: 0xff5a10, emissiveIntensity: 1.8, roughness: 0.5, flatShading: true });
+        this.material.bossBullet = this.material.bossBullet
+          || new THREE.MeshBasicMaterial({ color: 0xffd060 });
+      }
     }
     if (snap.health !== undefined) dragon.health = snap.health;
     if (snap.maxHealth !== undefined) dragon.maxHealth = snap.maxHealth;
@@ -1153,6 +1201,18 @@ export class DragonManager {
     return this.removeServerDragon(id);
   }
 
+  /**
+   * Server-driven hit flash. Called by EnemySync on vs:weapon:hit. Returns
+   * true if this manager owns the given dragon id.
+   */
+  flashHit(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity || entity.dead) return false;
+    _flashEntityMeshShared(entity.mesh);
+    return true;
+  }
+
   clearServerEntities() {
     for (const dragon of this._serverEntities.values()) {
       dragon.dead = true;
@@ -1162,17 +1222,191 @@ export class DragonManager {
       if (idx >= 0) this.dragons.splice(idx, 1);
     }
     this._serverEntities.clear();
+    this._clearServerFireballs();
+    this._clearServerBossProjectiles();
   }
 
   /**
-   * Visual-only hook for the bridge's dragonFireball event. Stubbed: the
-   * weapons-server-pipeline agent owns the actual projectile semantics. We
-   * keep the method here so EnemySync can call it without a typecheck and
-   * a future patch only needs to fill this in.
+   * Visual-only hook for the bridge's dragonFireball event. The server owns
+   * collision, damage and lifetime; we just render the projectile so players
+   * can dodge it. Payload shape (see packages/shared/src/protocol.ts):
+   *   { fireball: { id, x, y, z, vx, vy, vz, ownerId, damage }, kind }
+   * where kind is "spawn" | "despawn" | "reflect".
    */
-  // eslint-disable-next-line no-unused-vars
-  handleServerFireball(_payload) {
-    // intentionally empty — visual stub
+  handleServerFireball(payload) {
+    if (!payload || !payload.fireball) return;
+    const fb = payload.fireball;
+    const kind = payload.kind || 'spawn';
+    if (fb.id === undefined || fb.id === null) return;
+
+    if (kind === 'spawn') {
+      this._spawnServerFireball(fb);
+    } else if (kind === 'reflect') {
+      this._reflectServerFireball(fb);
+    } else if (kind === 'despawn') {
+      this._despawnServerFireball(fb.id);
+    }
+  }
+
+  _spawnServerFireball(fb) {
+    // Idempotent — a duplicate spawn (e.g. backfill on join) re-syncs the
+    // position rather than spawning a second mesh.
+    const existing = this._serverFireballs.get(fb.id);
+    if (existing) {
+      existing.position.set(fb.x ?? 0, fb.y ?? 0, fb.z ?? 0);
+      existing.mesh.position.copy(existing.position);
+      existing.velocity.set(fb.vx ?? 0, fb.vy ?? 0, fb.vz ?? 0);
+      return;
+    }
+    const mesh = new THREE.Mesh(this.geometry.fireball, this.material.fireball);
+    mesh.name = 'DragonFireball';
+    mesh.position.set(fb.x ?? 0, fb.y ?? 0, fb.z ?? 0);
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+    const entry = {
+      id: fb.id,
+      mesh,
+      position: mesh.position.clone(),
+      velocity: new THREE.Vector3(fb.vx ?? 0, fb.vy ?? 0, fb.vz ?? 0),
+      reflected: false,
+    };
+    this._serverFireballs.set(fb.id, entry);
+  }
+
+  _reflectServerFireball(fb) {
+    const entry = this._serverFireballs.get(fb.id);
+    if (!entry) {
+      // Reflect arrived before spawn — spawn first, then mark reflected.
+      this._spawnServerFireball(fb);
+      const created = this._serverFireballs.get(fb.id);
+      if (!created) return;
+      created.reflected = true;
+      created.mesh.material = this.material.reflectedFireball;
+      // Update velocity if the server re-aimed the projectile back at owner.
+      if (Number.isFinite(fb.vx)) created.velocity.x = fb.vx;
+      if (Number.isFinite(fb.vy)) created.velocity.y = fb.vy;
+      if (Number.isFinite(fb.vz)) created.velocity.z = fb.vz;
+      return;
+    }
+    entry.reflected = true;
+    entry.mesh.material = this.material.reflectedFireball;
+    if (Number.isFinite(fb.vx)) entry.velocity.x = fb.vx;
+    if (Number.isFinite(fb.vy)) entry.velocity.y = fb.vy;
+    if (Number.isFinite(fb.vz)) entry.velocity.z = fb.vz;
+    // Server position trumps local extrapolation after a reflect.
+    if (Number.isFinite(fb.x)) entry.position.x = fb.x;
+    if (Number.isFinite(fb.y)) entry.position.y = fb.y;
+    if (Number.isFinite(fb.z)) entry.position.z = fb.z;
+    entry.mesh.position.copy(entry.position);
+  }
+
+  _despawnServerFireball(id) {
+    const entry = this._serverFireballs.get(id);
+    if (!entry) return;
+    // Cheap impact FX at the despawn point — matches the singleplayer feel
+    // without applying any damage locally (server already routed Damage).
+    this.impacts.push({ position: entry.position.clone(), damage: 0, hitPlayer: false });
+    this.group.remove(entry.mesh);
+    this._serverFireballs.delete(id);
+  }
+
+  /** Integrate every server-driven fireball forward by its broadcast velocity. */
+  _updateServerFireballs(dt) {
+    for (const entry of this._serverFireballs.values()) {
+      entry.position.addScaledVector(entry.velocity, dt);
+      entry.mesh.position.copy(entry.position);
+      entry.mesh.rotation.x += dt * 8;
+      entry.mesh.rotation.y += dt * 5;
+    }
+  }
+
+  /**
+   * EnemySync forwards every server EnemyEvent broadcast here so the dragon
+   * manager can react to the wave-5 miniboss attack events:
+   *
+   *   boss:ground  — spawn a glowing fireball that streaks toward the
+   *                  ground at the target point.
+   *   boss:homing  — a fast bolt with a slight curve.
+   *   boss:bullet  — a machine-gun bullet.
+   *
+   * Payload shape (see protocol.EnemyEventPayload):
+   *   { enemyId, event, origin: [x,y,z], target: [x,y,z] }
+   *
+   * The server still owns damage and lifetime — we only mint a visual mesh
+   * that drifts toward `target` for a short timer.
+   */
+  handleServerEnemyEvent(payload) {
+    if (!payload || typeof payload.event !== 'string') return;
+    const ev = payload.event;
+    if (ev !== 'boss:ground' && ev !== 'boss:homing' && ev !== 'boss:bullet') return;
+    const origin = Array.isArray(payload.origin) ? payload.origin : null;
+    const target = Array.isArray(payload.target) ? payload.target : null;
+    if (!origin || origin.length < 3) return;
+    // No target means it's a ground-zone tick (the spawn event for the fire
+    // zone after a ground ball lands). The visual is handled implicitly by
+    // the impact effect spawn below, so we just stop here.
+    if (!target || target.length < 3) return;
+
+    // Lazily mint materials if applyServerDragon hasn't run yet (e.g. boss
+    // event arrived before its first state snapshot).
+    const bossCfg = this.bossConfig ?? (BALANCE?.boss ?? null);
+    if (!bossCfg) return;
+    this.material.bossBall = this.material.bossBall
+      || new THREE.MeshStandardMaterial({ color: bossCfg.fire, emissive: bossCfg.fire, emissiveIntensity: 1.6, roughness: 0.5, flatShading: true });
+    this.material.bossBolt = this.material.bossBolt
+      || new THREE.MeshStandardMaterial({ color: 0xff7a2a, emissive: 0xff5a10, emissiveIntensity: 1.8, roughness: 0.5, flatShading: true });
+    this.material.bossBullet = this.material.bossBullet
+      || new THREE.MeshBasicMaterial({ color: 0xffd060 });
+
+    let material; let scale; let speed; let life;
+    if (ev === 'boss:ground') {
+      material = this.material.bossBall; scale = 2.4; speed = bossCfg.ground.speed; life = 5;
+    } else if (ev === 'boss:homing') {
+      material = this.material.bossBolt; scale = 0.7; speed = bossCfg.homing.speed; life = bossCfg.homing.life;
+    } else {
+      material = this.material.bossBullet; scale = 0.32; speed = bossCfg.machinegun.speed; life = bossCfg.machinegun.life;
+    }
+
+    const mesh = new THREE.Mesh(this.geometry.fireball, material);
+    mesh.scale.setScalar(scale);
+    mesh.position.set(origin[0], origin[1], origin[2]);
+    mesh.frustumCulled = false;
+    this.group.add(mesh);
+
+    // Build a velocity vector from origin → target so the mesh streaks toward
+    // the predicted impact even if the actual server projectile curves
+    // afterward (homing). The server still decides where damage lands.
+    const dx = target[0] - origin[0];
+    const dy = target[1] - origin[1];
+    const dz = target[2] - origin[2];
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const velocity = new THREE.Vector3(
+      (dx / len) * speed,
+      (dy / len) * speed,
+      (dz / len) * speed,
+    );
+    this._serverBossProjectiles.push({ mesh, velocity, life });
+  }
+
+  /** Integrate every visual boss projectile by its broadcast velocity. */
+  _updateServerBossProjectiles(dt) {
+    for (let i = this._serverBossProjectiles.length - 1; i >= 0; i -= 1) {
+      const p = this._serverBossProjectiles[i];
+      p.life -= dt;
+      p.mesh.position.addScaledVector(p.velocity, dt);
+      p.mesh.rotation.x += dt * 8;
+      p.mesh.rotation.y += dt * 5;
+      if (p.life <= 0) {
+        this.group.remove(p.mesh);
+        this._serverBossProjectiles.splice(i, 1);
+      }
+    }
+  }
+
+  /** Drop every visual boss projectile (e.g. on disconnect). */
+  _clearServerBossProjectiles() {
+    for (const p of this._serverBossProjectiles) this.group.remove(p.mesh);
+    this._serverBossProjectiles.length = 0;
   }
 
   dispose() {
@@ -1190,6 +1424,7 @@ export class DragonManager {
     this.impacts.length = 0;
     this.dragons.length = 0;
     this._serverEntities.clear();
+    this._clearServerFireballs();
 
     for (const geometry of Object.values(this.geometry)) {
       geometry.dispose();

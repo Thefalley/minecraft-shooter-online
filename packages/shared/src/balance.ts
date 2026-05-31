@@ -173,6 +173,65 @@ export const DRAGON_BALANCE = {
   wingFlapAmplitude: 0.55,
 } as const;
 
+/**
+ * Wave-5 miniboss: a single red dragon with a far bigger HP pool that cycles
+ * through three attack patterns (ground balls, homing bolts, machine-gun
+ * burst). Mirrors BALANCE.boss in apps/game/src/core/config/GameBalance.js
+ * so the server can author the boss authoritatively.
+ */
+export const BOSS_BALANCE = {
+  wave: 5,
+  enemyScale: 0.5,
+  health: 900,
+  scale: 1.9,
+  color: 0xb01818,
+  fire: 0xff3a10,
+  orbitRadius: 15,
+  altitude: 17.5,
+  ground: {
+    speed: 17,
+    damage: 10,
+    count: 2,
+    zoneRadius: 4.2,
+    zoneDps: 22,
+    zoneTtl: 5,
+    tickRate: 0.5,
+  },
+  homing: {
+    speed: 30,
+    damage: 9,
+    count: 5,
+    turn: 2.2,
+    life: 3,
+    radius: 0.7,
+  },
+  machinegun: {
+    speed: 46,
+    damage: 4,
+    burst: 22,
+    interval: 0.06,
+    spread: 0.07,
+    life: 2.2,
+    radius: 0.45,
+  },
+  attackEvery: [1.6, 2.6] as const,
+} as const;
+
+/**
+ * Wave-10 cutscene: a meteor smashes the castle into a crater. Used by both
+ * the singleplayer flow and the multiplayer server (which broadcasts a
+ * cinematic flag so every client plays the same animation at the same time).
+ */
+export const METEOR_BALANCE = {
+  wave: 10,
+  height: 95,
+  fallTime: 1.8,
+  flashTime: 0.9,
+  craterRadius: 18,
+  /** Total seconds the cinematic locks the room in. fall + flash + small buffer. */
+  duration: 3.0,
+} as const;
+
 export const WORLD_BALANCE = {
   blockSize: 1,
   width: 80,

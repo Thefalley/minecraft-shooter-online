@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { moveHorizontal, easeToGround } from '../../engine/Collision.js';
+import { _flashEntityMeshShared } from './ZombieManager.js';
 
 const DEFAULT_BOUNDS = { minX: -22, maxX: 22, minZ: -22, maxZ: 22 };
 const ARROW_HIT_RADIUS = 1.0;
@@ -208,6 +209,11 @@ export class SkeletonManager {
         if (skeleton.dead || !skeleton.serverOwned) continue;
         _interpServerEntity(skeleton, now);
       }
+      // Tick any visual-only arrows spawned by server enemy:shoot events so
+      // they fly + expire without the local AI. Damage is server-authoritative
+      // so updateArrows is invoked with a sentinel that suppresses local hits.
+      const playerPos = getWorldPosition(player, this.tmpPlayer);
+      this.updateArrows(dt, player, playerPos);
       return;
     }
 
@@ -327,7 +333,9 @@ export class SkeletonManager {
       const hitPlayer = Boolean(player) && arrow.position.distanceTo(playerPos) <= ARROW_HIT_RADIUS + 0.6;
       if (hitPlayer) {
         // The knight's guard reflects the arrow back at its owner.
-        if (player.guardActive && arrow.owner && !arrow.owner.dead) {
+        // In server-authority mode, damage and reflections are decided by the
+        // server; the local arrow is purely a visual cue.
+        if (this._authority !== 'server' && player.guardActive && arrow.owner && !arrow.owner.dead) {
           arrow.reflected = true;
           arrow.damage = this.reflectDamage;
           arrow.life = 4;
@@ -336,7 +344,8 @@ export class SkeletonManager {
           this.impacts.push({ position: arrow.position.clone(), damage: 0, hitPlayer: false, reflected: true });
           continue;
         }
-        this.impacts.push({ position: arrow.position.clone(), damage: arrow.damage, hitPlayer: true });
+        const dmg = this._authority === 'server' ? 0 : arrow.damage;
+        this.impacts.push({ position: arrow.position.clone(), damage: dmg, hitPlayer: this._authority !== 'server' });
         this._removeArrow(i);
       }
     }
@@ -596,6 +605,12 @@ export class SkeletonManager {
 
   applyServerEnemy(snap) {
     if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    // Override server flat-Y with client terrain height — server uses
+    // PLAYER_SPAWN_Y=1 for all enemies; meadow/snowland terrain varies.
+    const groundY = (this.world && typeof this.world.getGroundHeight === 'function')
+      ? this.world.getGroundHeight(snap.x, snap.z)
+      : snap.y;
+    snap = { ...snap, y: groundY };
     let entity = this._serverEntities.get(snap.id);
     if (!entity) {
       const mesh = this.createSkeletonMesh(this._serverEntities.size);
@@ -643,6 +658,43 @@ export class SkeletonManager {
       if (idx >= 0) this.skeletons.splice(idx, 1);
     }
     this._serverEntities.clear();
+  }
+
+  /**
+   * Server-driven shoot cue. Called by EnemySync when the server broadcasts
+   * vs:enemy:event for one of our skeletons. Visual-only: spawn an arrow
+   * heading toward the server-provided target. Damage is authoritative on
+   * the server; the local arrow expires by lifetime or by distance and never
+   * mutates player HP in server mode.
+   *
+   * @param {{enemyId:string|number, event:string, target?:[number,number,number]}} payload
+   */
+  handleServerEnemyEvent(payload) {
+    if (this._authority !== 'server' || !payload) return;
+    if (payload.event !== 'shoot') return;
+    const skeleton = this._serverEntities.get(payload.enemyId);
+    if (!skeleton || skeleton.dead) return;
+    const t = payload.target;
+    if (!Array.isArray(t) || t.length < 3) return;
+    const target = new THREE.Vector3(
+      Number.isFinite(t[0]) ? t[0] : 0,
+      Number.isFinite(t[1]) ? t[1] : 0,
+      Number.isFinite(t[2]) ? t[2] : 0,
+    );
+    try { this.shootArrow(skeleton, target); } catch { /* swallow visual errors */ }
+  }
+
+  /**
+   * Server-driven hit flash. Called by EnemySync on vs:weapon:hit. Flashes
+   * the mesh red briefly so every observer sees the impact, independent of
+   * who fired. Returns true if this manager owns `id`.
+   */
+  flashHit(id) {
+    if (id === undefined || id === null) return false;
+    const entity = this._serverEntities.get(id);
+    if (!entity || entity.dead) return false;
+    _flashEntityMeshShared(entity.mesh);
+    return true;
   }
 
   dispose() {
