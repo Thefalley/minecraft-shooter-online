@@ -40,6 +40,7 @@ const forwarded = rawArgs.filter((a) => !a.startsWith('--skip'));
 const suites = [
   { key: 'server', name: 'Multiplayer server (raw Colyseus, 2 clients)', file: 'server-multiplayer.mjs' },
   { key: 'behavior', name: 'Feature behavior (chase, drift, late join, world sync)', file: 'behavior-multiplayer.mjs' },
+  { key: 'sync', name: 'Sync-rate (server vs client tick, inter-client drift)', file: 'sync-rate.mjs' },
   { key: 'ui', name: 'UI + game physics (Playwright)', file: 'ui-game-physics.mjs' },
 ];
 

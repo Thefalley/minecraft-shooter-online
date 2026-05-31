@@ -126,6 +126,15 @@ export class NetworkBridge {
   }
 
   /**
+   * The "vs:world:seed" message arrives once on join, before any caller
+   * (WorldSync etc.) has had a chance to subscribe. Cache it so a late
+   * subscriber can backfill from here. Returns null if not received yet.
+   */
+  getLastWorldSeed() {
+    return this._lastWorldSeed ?? null;
+  }
+
+  /**
    * Per-frame input push. The pump throttles to 20 Hz internally and only
    * actually sends when the command changes (or 1s keepalive).
    */
@@ -343,7 +352,11 @@ export class NetworkBridge {
 
     // ── VoxelServerMessage (combat/world/economy added in protocol agent) ──
     const V = VoxelServerMessage || {};
-    onMsg(mkey(V, "WorldSeed", "server:world:seed"), "worldSeed");
+    onMsg(mkey(V, "WorldSeed", "server:world:seed"), "worldSeed", (p) => {
+      // Cache so WorldSync can backfill if it subscribed too late.
+      this._lastWorldSeed = p;
+      return p;
+    });
     onMsg(mkey(V, "WorldDelta", "server:world:delta"), "worldDelta");
     onMsg(mkey(V, "PlayerSnapshot", "server:player:snapshot"), "playerSnapshot");
     onMsg(mkey(V, "EnemySpawn", "server:enemy:spawn"), "enemySpawn");

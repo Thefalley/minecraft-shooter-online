@@ -56,6 +56,32 @@ export class WorldSync {
     );
     // 3. Intercept local mining / placement so they go through the server.
     this._patchWorldMutators();
+
+    // Backfill: the bridge attached to the room before this WorldSync
+    // existed, so the initial "worldSeed" message has already fired and
+    // we missed it. Without this backfill the client renders its own
+    // randomly-generated terrain while the server's enemies stand on
+    // SERVER terrain — player floats at ~Y=10 while enemies are at Y=1
+    // and invisible to the player (the user actually saw this).
+    const cached = typeof this._bridge.getLastWorldSeed === "function"
+      ? this._bridge.getLastWorldSeed()
+      : null;
+    if (cached) {
+      try {
+        this._onWorldSeed(cached);
+        if (typeof window !== "undefined" && window.__voxelDebug) {
+          window.__voxelDebug.push("worldSync:backfill", {
+            seed: cached.seed,
+            width: cached.width,
+            depth: cached.depth,
+          });
+        }
+      } catch (err) {
+        if (this._debug) console.warn("[WorldSync] backfill failed", err);
+      }
+    } else if (typeof window !== "undefined" && window.__voxelDebug) {
+      window.__voxelDebug.push("worldSync:backfill", { miss: "no cached seed" });
+    }
   }
 
   disable() {
