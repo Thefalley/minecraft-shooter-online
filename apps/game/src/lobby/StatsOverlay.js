@@ -35,15 +35,28 @@ export class StatsOverlay {
     const el = document.createElement('div');
     el.className = 'vd-stats-overlay';
     el.innerHTML = `
+      <div class="row room"><span class="lbl">SALA</span><span class="val v-room">-----</span></div>
       <div class="row"><span class="lbl">FPS</span><span class="val v-fps">--</span></div>
       <div class="row"><span class="lbl">PING</span><span class="val v-ping p-idle">--</span></div>
     `;
     document.body.appendChild(el);
     this._root = el;
+    this._roomEl = el.querySelector('.v-room');
     this._fpsEl = el.querySelector('.v-fps');
     this._pingEl = el.querySelector('.v-ping');
+    this._stopped = false; // reset so a remount after unmount re-enables the rAF loop
     this._startFpsLoop();
     this._startPingPoller();
+  }
+
+  /**
+   * External setter: main.js calls this with the authoritative room code
+   * once the bridge welcome event arrives so the player always sees which
+   * room they're in without having to alt-tab to the lobby.
+   */
+  setRoomCode(code) {
+    if (!this._roomEl) return;
+    this._roomEl.textContent = code ? String(code).toUpperCase() : '-----';
   }
 
   unmount() {

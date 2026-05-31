@@ -58,9 +58,15 @@ async function startMultiplayer({ name, code, characterId, mode }) {
 
     const bridge = coordinator.getBridge();
 
-    // Persistent overlay (top-right FPS/PING) — mirrors apps/web.
+    // Persistent overlay (top-right FPS/PING + room code) — mirrors apps/web.
     stats = new StatsOverlay();
     stats.mount();
+    // Welcome may have already fired (we awaited start() above) — try to
+    // grab the room code immediately, and also subscribe so a reconnect
+    // updates it.
+    const initialCode = bridge.getRoomCode?.() ?? bridge.getRoomState?.()?.roomCode ?? null;
+    if (initialCode) stats.setRoomCode(initialCode);
+    bridge.on?.('welcome', (p) => stats?.setRoomCode?.(p?.roomCode));
 
     // If the URL hinted at a character (via the lobby flow), tell the
     // server up front so other clients render it correctly even before the
