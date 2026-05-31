@@ -8,8 +8,27 @@ export const PLAYER_NAME_MIN_LENGTH = 2;
 export const PLAYER_NAME_MAX_LENGTH = 16;
 
 // Movement
-export const PLAYER_SPEED = 6; // units per second on ground plane
-export const PLAYER_MAX_DELTA = PLAYER_SPEED * (TICK_INTERVAL_MS / 1000) * 1.5;
+//
+// Base ground speed in units per second. MUST match BALANCE.player.moveSpeed
+// on the client (apps/game/src/core/config/GameBalance.js → moveSpeed) or the
+// server's stored player position will drift from the client's visual
+// position and AI starts chasing a ghost a few units behind/ahead of where
+// the user actually is.
+export const PLAYER_SPEED = 7;
+export const PLAYER_SPRINT_MULT = 1.5; // matches BALANCE.player.sprintMultiplier
+// Per-character ground-speed multiplier. Mirrors the speedMult field on each
+// entry of apps/game/src/content/characters/Characters.js so the server can
+// scale each player's input independently. Defaults to 1 if the player picks
+// a character the server doesn't know.
+export const PLAYER_SPEED_MULT_BY_CHARACTER: Record<string, number> = {
+  duck: 0.8,
+  knight: 0.6,
+  hunter: 1.0,
+  samurai: 0.85,
+  mage: 0.8,
+};
+export const PLAYER_MAX_DELTA =
+  PLAYER_SPEED * PLAYER_SPRINT_MULT * (TICK_INTERVAL_MS / 1000) * 1.5;
 export const WORLD_HALF_SIZE = 50; // bounds: -50..50 on X and Z
 export const PLAYER_SPAWN_Y = 1;
 export const PLAYER_DEFAULT_HEALTH = 100;

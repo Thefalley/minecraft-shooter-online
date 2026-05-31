@@ -16,6 +16,8 @@ import {
   PLAYER_MAX_DELTA,
   PLAYER_SPAWN_Y,
   PLAYER_SPEED,
+  PLAYER_SPEED_MULT_BY_CHARACTER,
+  PLAYER_SPRINT_MULT,
   PROJECTILE_LIFETIME_S,
   ServerMessage,
   SHOP_DURATION_MS,
@@ -66,6 +68,7 @@ interface BufferedInput {
   left: boolean;
   right: boolean;
   jump: boolean;
+  sprint: boolean;
   rotationY: number;
   pitch: number;
   seq: number;
@@ -390,22 +393,23 @@ export class GameRoom extends Room<GameState> {
     player.id = client.sessionId;
     player.name = name;
 
-    // Spawn south of the meadow castle. The current MP map (meadow) has a
-    // stone castle at (0,0) with castleHalf=8 and a south gate at z=+8;
-    // spawning at (0,0) traps every player inside the walls and the AI
-    // chases them but they can't see anything. The CLIENT picks z=18 in
-    // its onWorldRebuilt hook — the server must agree on the SAME spot or
-    // the AI targets the server's ghost position while the player's
-    // visual is 18 blocks south.
-    //
-    // Each concurrent joiner is offset on a small arc so they don't
-    // overlap, but still inside the safe south corridor.
-    const SPAWN_BASE_X = 0;
-    const SPAWN_BASE_Z = 18;
-    const angle = (this.spawnAngle += Math.PI / 4);
+    // Spawn south of the meadow castle. Client puts itself at
+    // (0.5, surface, 18.5) and the server must agree EXACTLY for the
+    // first joiner — otherwise the AI targets a 0.5+ unit ghost of the
+    // player from the moment they connect. Each subsequent joiner is
+    // offset on a small arc so they don't overlap at the same tile.
+    const SPAWN_BASE_X = 0.5;
+    const SPAWN_BASE_Z = 18.5;
     const radius = 1.5;
-    player.x = SPAWN_BASE_X + Math.cos(angle) * radius;
-    player.z = SPAWN_BASE_Z + Math.sin(angle) * radius;
+    if (this.state.players.size === 0) {
+      // First joiner = exact client spawn. No arc offset.
+      player.x = SPAWN_BASE_X;
+      player.z = SPAWN_BASE_Z;
+    } else {
+      const angle = (this.spawnAngle += Math.PI / 4);
+      player.x = SPAWN_BASE_X + Math.cos(angle) * radius;
+      player.z = SPAWN_BASE_Z + Math.sin(angle) * radius;
+    }
     player.y = PLAYER_SPAWN_Y;
     // Face north so the player can see the castle (and the wave-1 enemies
     // that spawn in a ring around the origin).
@@ -575,6 +579,7 @@ export class GameRoom extends Room<GameState> {
       left: !!input.left,
       right: !!input.right,
       jump: !!input.jump,
+      sprint: !!(input as { sprint?: unknown }).sprint,
       rotationY:
         typeof input.rotationY === "number" && Number.isFinite(input.rotationY)
           ? input.rotationY
@@ -1213,8 +1218,18 @@ export class GameRoom extends Room<GameState> {
       const worldX = mx * cos - mz * sin;
       const worldZ = mx * sin + mz * cos;
 
-      let dx = worldX * PLAYER_SPEED * dt;
-      let dz = worldZ * PLAYER_SPEED * dt;
+      // Effective speed = base × character speedMult × (sprint? sprintMult : 1).
+      // MUST match the client (apps/game/src/game/Player.js) or the server's
+      // stored player position drifts from the user's visual position by a
+      // few units per second and the AI starts chasing a ghost.
+      const charMult =
+        PLAYER_SPEED_MULT_BY_CHARACTER[player.characterId] ?? 1;
+      const sprintMult = (input as { sprint?: boolean }).sprint
+        ? PLAYER_SPRINT_MULT
+        : 1;
+      const effectiveSpeed = PLAYER_SPEED * charMult * sprintMult;
+      let dx = worldX * effectiveSpeed * dt;
+      let dz = worldZ * effectiveSpeed * dt;
 
       // Per-tick delta clamp (defensive).
       const deltaLen = Math.hypot(dx, dz);

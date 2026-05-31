@@ -1137,6 +1137,11 @@ export class Game {
       left: k('KeyA', 'a', 'left', 'moveLeft'),
       right: k('KeyD', 'd', 'right', 'moveRight'),
       jump: k('Space', ' ', 'space', 'jump'),
+      // Sprint matters for server-side speed: BALANCE.player.sprintMultiplier
+      // is 1.5×; if we omit this flag the server runs at base speed while the
+      // client visual sprints, and the player visibly outruns the server's
+      // stored position — AI then chases a ghost a few units behind.
+      sprint: k('ShiftLeft', 'ShiftRight', 'shift', 'sprint'),
       rotationY: this.player?.cameraHolder?.rotation?.y ?? 0,
       pitch: this.player?.pitchHolder?.rotation?.x ?? 0,
       seq: (this._inputSeq = (this._inputSeq ?? 0) + 1),
