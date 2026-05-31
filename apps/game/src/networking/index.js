@@ -9,4 +9,5 @@ export { InputPump } from "./InputPump.js";
 export { RemotePlayerMesh } from "./RemotePlayerMesh.js";
 export { MultiplayerCoordinator } from "./MultiplayerCoordinator.js";
 export { RemotePlayerRegistry } from "./RemotePlayerRegistry.js";
+export { EnemySync } from "./EnemySync.js";
 export { readJoinParams, clearJoinParams } from "./UrlParams.js";

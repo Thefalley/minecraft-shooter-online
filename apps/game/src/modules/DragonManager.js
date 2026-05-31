@@ -14,6 +14,59 @@ const HEALTHBAR_MAX_DISTANCE_SQ = 40 * 40;
 // Cleared at the top of each peek/hit; never re-allocated per shot.
 const _INTERSECT_SCRATCH = [];
 
+// Snapshot interpolation tuning for server-driven dragons (multiplayer).
+const SERVER_SNAPSHOT_BUFFER = 8;
+const SERVER_INTERP_DELAY_MS = 120;
+
+function _pushServerSnap(buffer, snap) {
+  const now = performance.now();
+  const last = buffer[buffer.length - 1];
+  if (last && last.t >= now) return;
+  buffer.push({
+    t: now,
+    x: Number.isFinite(snap.x) ? snap.x : 0,
+    y: Number.isFinite(snap.y) ? snap.y : 0,
+    z: Number.isFinite(snap.z) ? snap.z : 0,
+    rotationY: Number.isFinite(snap.rotationY) ? snap.rotationY : 0,
+  });
+  if (buffer.length > SERVER_SNAPSHOT_BUFFER) buffer.shift();
+}
+
+function _shortAngleDelta(from, to) {
+  let d = to - from;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+function _interpServerDragon(entity, now) {
+  const buf = entity._buffer;
+  if (!buf || buf.length === 0) return;
+  const renderT = now - SERVER_INTERP_DELAY_MS;
+  const pos = entity.mesh.position;
+  if (renderT <= buf[0].t) {
+    pos.set(buf[0].x, buf[0].y, buf[0].z);
+    entity.mesh.rotation.y = buf[0].rotationY;
+    return;
+  }
+  const newest = buf[buf.length - 1];
+  if (renderT >= newest.t) {
+    pos.set(newest.x, newest.y, newest.z);
+    entity.mesh.rotation.y = newest.rotationY;
+    return;
+  }
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t > renderT) i--;
+  const a = buf[i];
+  const b = buf[i + 1];
+  const span = b.t - a.t;
+  const alpha = span > 0 ? (renderT - a.t) / span : 0;
+  pos.x = a.x + (b.x - a.x) * alpha;
+  pos.y = a.y + (b.y - a.y) * alpha;
+  pos.z = a.z + (b.z - a.z) * alpha;
+  entity.mesh.rotation.y = a.rotationY + _shortAngleDelta(a.rotationY, b.rotationY) * alpha;
+}
+
 function lerpAngle(from, to, alpha) {
   const delta = Math.atan2(Math.sin(to - from), Math.cos(to - from));
   return from + delta * THREE.MathUtils.clamp(alpha, 0, 1);
@@ -58,6 +111,11 @@ export class DragonManager {
     this._headForwardOffset = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
     this._worldUp = new THREE.Vector3(0, 1, 0);
     this.elapsed = 0;
+
+    // Multiplayer: 'server' disables orbit/fireball AI and switches update()
+    // to pure snapshot interpolation. Default 'local'.
+    this._authority = 'local';
+    this._serverEntities = new Map();
 
     this.count = options.count ?? DEFAULT_DRAGON_COUNT;
     this.origin = options.origin?.isVector3 ? options.origin.clone() : new THREE.Vector3(0, 0, 0);
@@ -440,6 +498,20 @@ export class DragonManager {
 
     const dt = Math.min(delta || 0, 0.08);
     this.elapsed += dt;
+
+    // Server-authoritative mode: no orbit AI, no fireballs, no health bars.
+    // Just interpolate every server-owned dragon mesh toward its newest snap.
+    // (Health-bar/fireball visuals will return when the dedicated dragon
+    // schema fields and the dragonFireball event pipeline land.)
+    if (this._authority === 'server') {
+      const now = performance.now();
+      for (const dragon of this.dragons) {
+        if (dragon.dead || !dragon.serverOwned) continue;
+        _interpServerDragon(dragon, now);
+      }
+      return;
+    }
+
     const playerPosition = getWorldPosition(player, this.tmpPlayerPosition);
 
     for (const dragon of this.dragons) {
@@ -744,9 +816,14 @@ export class DragonManager {
 
   applyRayHit(peek, damage) {
     const dragon = peek.dragon;
-    dragon.health = Math.max(0, dragon.health - damage);
-    if (dragon.health <= 0) {
-      this.killDragon(dragon);
+    // Server-authority: never mutate HP locally; the server / weapons-hit
+    // pipeline owns that. We still return the hit info so the caller can
+    // play impact / tracer effects.
+    if (this._authority !== 'server') {
+      dragon.health = Math.max(0, dragon.health - damage);
+      if (dragon.health <= 0) {
+        this.killDragon(dragon);
+      }
     }
     return {
       dragon,
@@ -765,6 +842,7 @@ export class DragonManager {
   hitMelee(origin, direction, range, damage, arcCos = 0.3) {
     const results = [];
     const toTarget = new THREE.Vector3();
+    const serverMode = this._authority === 'server';
     for (const dragon of this.dragons) {
       if (dragon.dead) continue;
       toTarget.subVectors(dragon.mesh.position, origin);
@@ -772,9 +850,12 @@ export class DragonManager {
       if (distance > range || distance < 0.0001) continue;
       toTarget.normalize();
       if (toTarget.dot(direction) < arcCos) continue;
-      dragon.health = Math.max(0, dragon.health - damage);
-      const killed = dragon.health <= 0;
-      if (killed) this.killDragon(dragon);
+      let killed = false;
+      if (!serverMode) {
+        dragon.health = Math.max(0, dragon.health - damage);
+        killed = dragon.health <= 0;
+        if (killed) this.killDragon(dragon);
+      }
       results.push({ position: dragon.mesh.position.clone(), killed });
     }
     return results;
@@ -811,15 +892,18 @@ export class DragonManager {
     const results = [];
     const seen = new Set();
 
+    const serverMode = this._authority === 'server';
     for (const intersection of hits) {
       const root = intersection.object.userData.dragonRoot;
       const dragon = this.dragons.find((candidate) => candidate.mesh === root);
       if (!dragon || dragon.dead || seen.has(dragon.id)) continue;
 
       seen.add(dragon.id);
-      dragon.health = Math.max(0, dragon.health - damage);
-      if (dragon.health <= 0) {
-        this.killDragon(dragon);
+      if (!serverMode) {
+        dragon.health = Math.max(0, dragon.health - damage);
+        if (dragon.health <= 0) {
+          this.killDragon(dragon);
+        }
       }
 
       results.push({
@@ -837,15 +921,19 @@ export class DragonManager {
   hitBox(origin, forward, right, length, halfWidth, damage) {
     const results = [];
     const v = new THREE.Vector3();
+    const serverMode = this._authority === 'server';
     for (const dragon of this.dragons) {
       if (dragon.dead) continue;
       v.subVectors(dragon.mesh.position, origin);
       const f = v.dot(forward);
       const lateral = Math.abs(v.dot(right));
       if (f < -1 || f > length || lateral > halfWidth || Math.abs(v.y) > 5) continue;
-      dragon.health = Math.max(0, dragon.health - damage);
-      const killed = dragon.health <= 0;
-      if (killed) this.killDragon(dragon);
+      let killed = false;
+      if (!serverMode) {
+        dragon.health = Math.max(0, dragon.health - damage);
+        killed = dragon.health <= 0;
+        if (killed) this.killDragon(dragon);
+      }
       results.push({ position: dragon.mesh.position.clone(), killed });
     }
     return results;
@@ -933,6 +1021,114 @@ export class DragonManager {
     return impacts;
   }
 
+  // --- server authority (multiplayer) --------------------------------------
+
+  setAuthority(mode) {
+    const next = mode === 'server' ? 'server' : 'local';
+    if (next === this._authority) return;
+    this._authority = next;
+    if (next === 'server') {
+      // Drop the locally-spawned orbiting dragons and any in-flight fireballs
+      // so the player only sees server-driven entities.
+      this.clearDragons();
+      for (const fireball of this.fireballs) this.group.remove(fireball);
+      this.fireballs.length = 0;
+    } else {
+      this.clearServerEntities();
+    }
+  }
+
+  /**
+   * Upsert a server-broadcast dragon. The first call spawns the visual; later
+   * calls push to its interpolation buffer.
+   */
+  applyServerDragon(snap) {
+    if (this._authority !== 'server' || !snap || snap.id === undefined || snap.id === null) return;
+    let dragon = this._serverEntities.get(snap.id);
+    if (!dragon) {
+      const mesh = this.createDragonMesh(this._serverEntities.size);
+      mesh.position.set(snap.x, snap.y, snap.z);
+      mesh.rotation.y = snap.rotationY ?? 0;
+      dragon = {
+        id: snap.id,
+        serverOwned: true,
+        health: snap.health ?? 100,
+        maxHealth: snap.maxHealth ?? 100,
+        mesh,
+        // Health bar visuals only matter once we wire the server HP feed
+        // through onChange. Built but kept hidden for now.
+        healthBar: null,
+        velocity: new THREE.Vector3(),
+        dead: false,
+        _buffer: [],
+        // Default LOD list so peekRay/hitAllByRay's cached-mesh path works.
+        _lodMeshes: [[], [], []],
+        _collisionMeshes: [],
+      };
+      // Mirror the spawnDragons LOD-mesh caching so weapons can still raycast
+      // against server-driven dragons even though no LOD switching runs.
+      const ud = mesh.userData;
+      const lodGroups = [ud.lod0, ud.lod1, ud.lod2];
+      for (let li = 0; li < lodGroups.length; li += 1) {
+        const lodGroup = lodGroups[li];
+        if (!lodGroup) continue;
+        lodGroup.traverse((obj) => {
+          if (obj.isMesh && obj.userData.dragonRoot === mesh) {
+            dragon._lodMeshes[li].push(obj);
+          }
+        });
+      }
+      dragon._collisionMeshes = dragon._lodMeshes[0];
+      mesh.userData.dragon = dragon;
+      this.group.add(mesh);
+      this.dragons.push(dragon);
+      this._serverEntities.set(snap.id, dragon);
+    }
+    if (snap.health !== undefined) dragon.health = snap.health;
+    if (snap.maxHealth !== undefined) dragon.maxHealth = snap.maxHealth;
+    _pushServerSnap(dragon._buffer, snap);
+  }
+
+  /**
+   * Symmetric with the other managers: EnemySync calls this on any enemy
+   * despawn since it doesn't always know the kind. Returns true if owned.
+   */
+  removeServerEnemy(id) {
+    if (id === undefined || id === null) return false;
+    const dragon = this._serverEntities.get(id);
+    if (!dragon) return false;
+    dragon.dead = true;
+    dragon.mesh.visible = false;
+    this.group.remove(dragon.mesh);
+    if (dragon.healthBar) this.group.remove(dragon.healthBar);
+    this._serverEntities.delete(id);
+    const idx = this.dragons.indexOf(dragon);
+    if (idx >= 0) this.dragons.splice(idx, 1);
+    return true;
+  }
+
+  clearServerEntities() {
+    for (const dragon of this._serverEntities.values()) {
+      dragon.dead = true;
+      this.group.remove(dragon.mesh);
+      if (dragon.healthBar) this.group.remove(dragon.healthBar);
+      const idx = this.dragons.indexOf(dragon);
+      if (idx >= 0) this.dragons.splice(idx, 1);
+    }
+    this._serverEntities.clear();
+  }
+
+  /**
+   * Visual-only hook for the bridge's dragonFireball event. Stubbed: the
+   * weapons-server-pipeline agent owns the actual projectile semantics. We
+   * keep the method here so EnemySync can call it without a typecheck and
+   * a future patch only needs to fill this in.
+   */
+  // eslint-disable-next-line no-unused-vars
+  handleServerFireball(_payload) {
+    // intentionally empty — visual stub
+  }
+
   dispose() {
     if (this.group.parent) {
       this.group.parent.remove(this.group);
@@ -943,6 +1139,7 @@ export class DragonManager {
     this.fireballs.length = 0;
     this.impacts.length = 0;
     this.dragons.length = 0;
+    this._serverEntities.clear();
 
     for (const geometry of Object.values(this.geometry)) {
       geometry.dispose();
