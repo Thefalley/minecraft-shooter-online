@@ -120,11 +120,25 @@ export class Game {
       if (bridge) {
         this._worldSync = new WorldSync(this.world, bridge, {
           onWorldRebuilt: () => {
-            // World geometry changed under the player — snap them to the
-            // fresh spawn point so they don't end up inside terrain or
-            // floating above it.
-            if (this.player && typeof this.player.setPosition === 'function') {
+            // Multiplayer: trust the server's authoritative player position
+            // (PLAYER_SPAWN_Y = 1) instead of the client's terrain-aware
+            // getSpawnPoint() which puts the player at Y≈9. Without this
+            // the local player floats 8 units above the ground and never
+            // sees server-broadcast enemies (which live at Y=1).
+            if (!this.player || typeof this.player.setPosition !== 'function') return;
+            const selfId = bridge.getSelfSessionId?.();
+            const state = bridge.getRoomState?.();
+            const me = selfId ? state?.players?.get?.(selfId) : null;
+            if (me && Number.isFinite(me.x) && Number.isFinite(me.y) && Number.isFinite(me.z)) {
+              this.player.setPosition(me.x, me.y, me.z);
+              if (typeof window !== 'undefined' && window.__voxelDebug) {
+                window.__voxelDebug.push('player:spawn:server', { x: me.x, y: me.y, z: me.z });
+              }
+            } else {
               this.player.setPosition(...this.world.getSpawnPoint().toArray());
+              if (typeof window !== 'undefined' && window.__voxelDebug) {
+                window.__voxelDebug.push('player:spawn:fallback', { reason: 'no server pos' });
+              }
             }
           },
         });
