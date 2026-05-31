@@ -21,6 +21,60 @@ import { EnemySync } from '../networking/EnemySync.js';
 
 export class Game {
   constructor(root, options = {}) {
+    // Init debug ring buffer BEFORE any subsystem (EnemySync, WorldSync,
+    // …) so their enable() events land in the ring. Idempotent — keeps
+    // an existing instance if Game is recreated.
+    if (typeof window !== 'undefined' && !window.__voxelDebug) {
+      window.__voxelDebug = {
+        enabled: new URLSearchParams(window.location.search).get('debug') === '1',
+        ring: [],
+        push(category, payload) {
+          if (this.ring.length >= 500) this.ring.shift();
+          this.ring.push({ t: Date.now(), category, payload });
+          if (this.enabled) console.debug(`[vox:${category}]`, payload);
+        },
+        dump() {
+          const g = window.__voxelGame;
+          const bridge = g?.network?.getBridge?.();
+          const state = bridge?.getRoomState?.();
+          return {
+            time: new Date().toISOString(),
+            session: bridge?.getSelfSessionId?.() ?? null,
+            phase: state?.phase ?? null,
+            wave: state?.wave ?? g?.wave ?? null,
+            playerPos: g?.player?.position
+              ? { x: g.player.position.x, y: g.player.position.y, z: g.player.position.z }
+              : null,
+            worldSeed: g?.world?.options?.seed ?? null,
+            counts: {
+              statePlayers: state?.players?.size ?? null,
+              stateEnemies: state?.enemies?.size ?? null,
+              stateDragons: state?.dragons?.size ?? null,
+              stateWorldDeltas: state?.world?.deltas?.size ?? null,
+              localZombies: g?.zombies?.zombies?.length ?? null,
+              serverZombies: g?.zombies?._serverEntities?.size ?? null,
+              localSkeletons: g?.skeletons?.skeletons?.length ?? null,
+              serverSkeletons: g?.skeletons?._serverEntities?.size ?? null,
+              localDragons: g?.dragons?.dragons?.length ?? null,
+              serverDragons: g?.dragons?._serverEntities?.size ?? null,
+            },
+            authority: {
+              zombies: g?.zombies?._authority ?? null,
+              skeletons: g?.skeletons?._authority ?? null,
+              witches: g?.witches?._authority ?? null,
+              dragons: g?.dragons?._authority ?? null,
+            },
+            enemySync: { created: !!g?._enemySync, enabled: !!g?._enemySync?._enabled },
+            worldSync: { created: !!g?._worldSync, enabled: !!g?._worldSync?._enabled },
+            ring: this.ring.slice(-50),
+          };
+        },
+      };
+    }
+    if (typeof window !== 'undefined' && window.__voxelDebug) {
+      window.__voxelDebug.push('game:ctor', { hasNetwork: !!(options?.network) });
+    }
+
     this.root = root;
     this.character = options.character ?? CHARACTERS[0];
     this.onExit = options.onExit ?? null;
@@ -332,57 +386,7 @@ export class Game {
     this.renderer.setAnimationLoop(() => this.tick());
     if (typeof window !== 'undefined') {
       window.__voxelGame = this;
-      window.__voxelDebug = window.__voxelDebug ?? {
-        // ?debug=1 in the URL turns on verbose logging in the console AND
-        // a persistent ring buffer that automated diagnostics can read.
-        enabled: new URLSearchParams(window.location.search).get('debug') === '1',
-        ring: [], // last 500 events
-        push(category, payload) {
-          if (this.ring.length >= 500) this.ring.shift();
-          this.ring.push({ t: Date.now(), category, payload });
-          if (this.enabled) console.debug(`[vox:${category}]`, payload);
-        },
-        dump() {
-          // Snapshot of everything a debugger needs.
-          const g = window.__voxelGame;
-          const bridge = g?.network?.getBridge?.();
-          const state = bridge?.getRoomState?.();
-          return {
-            time: new Date().toISOString(),
-            session: bridge?.getSelfSessionId?.() ?? null,
-            phase: state?.phase ?? null,
-            wave: state?.wave ?? g?.wave ?? null,
-            playerPos: g?.player?.position
-              ? { x: g.player.position.x, y: g.player.position.y, z: g.player.position.z }
-              : null,
-            counts: {
-              statePlayers: state?.players?.size ?? null,
-              stateEnemies: state?.enemies?.size ?? null,
-              stateDragons: state?.dragons?.size ?? null,
-              localZombies: g?.zombies?.zombies?.length ?? null,
-              serverZombies: g?.zombies?._serverEntities?.size ?? null,
-              localSkeletons: g?.skeletons?.skeletons?.length ?? null,
-              serverSkeletons: g?.skeletons?._serverEntities?.size ?? null,
-              localWitches: g?.witches?.witches?.length ?? null,
-              serverWitches: g?.witches?._serverEntities?.size ?? null,
-              localDragons: g?.dragons?.dragons?.length ?? null,
-              serverDragons: g?.dragons?._serverEntities?.size ?? null,
-            },
-            authority: {
-              zombies: g?.zombies?._authority ?? null,
-              skeletons: g?.skeletons?._authority ?? null,
-              witches: g?.witches?._authority ?? null,
-              dragons: g?.dragons?._authority ?? null,
-            },
-            enemySync: {
-              created: !!g?._enemySync,
-              enabled: !!g?._enemySync?._enabled,
-            },
-            ring: this.ring.slice(-50),
-          };
-        },
-      };
-      window.__voxelDebug.push('game:start', { network: !!this.network });
+      window.__voxelDebug?.push?.('game:start', { network: !!this.network });
     }
   }
 

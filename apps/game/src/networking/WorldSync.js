@@ -57,30 +57,51 @@ export class WorldSync {
     // 3. Intercept local mining / placement so they go through the server.
     this._patchWorldMutators();
 
-    // Backfill: the bridge attached to the room before this WorldSync
-    // existed, so the initial "worldSeed" message has already fired and
-    // we missed it. Without this backfill the client renders its own
-    // randomly-generated terrain while the server's enemies stand on
-    // SERVER terrain — player floats at ~Y=10 while enemies are at Y=1
-    // and invisible to the player (the user actually saw this).
-    const cached = typeof this._bridge.getLastWorldSeed === "function"
-      ? this._bridge.getLastWorldSeed()
-      : null;
-    if (cached) {
-      try {
-        this._onWorldSeed(cached);
+    // Backfill: the Colyseus schema state.world already carries the seed
+    // and dimensions. Reading directly from the schema is more reliable
+    // than relying on the one-shot "vs:world:seed" message, which the
+    // bridge can miss if it fires before the bridge's onMessage handler
+    // is registered. The schema sync happens during the join handshake
+    // and is fully populated by the time enable() runs.
+    //
+    // Without this backfill the user sees: HUD says "3 zombies", but no
+    // zombies on screen because the client renders ITS OWN randomly-
+    // generated terrain (player floats at Y≈10) while the server's
+    // enemies stand on SERVER terrain at Y=1 — vertical mismatch puts
+    // the enemies below the local player's view of the ground.
+    try {
+      const state = typeof this._bridge.getRoomState === "function"
+        ? this._bridge.getRoomState()
+        : null;
+      const w = state?.world;
+      const seed = Number(w?.seed) || 0;
+      if (w && seed > 0) {
+        const deltas = [];
+        w.deltas?.forEach?.((value, key) => {
+          const [x, y, z] = key.split(",").map(Number);
+          deltas.push({ x, y, z, t: value, seq: 0, by: null });
+        });
+        this._onWorldSeed({
+          seed,
+          width: Number(w.width) || 64,
+          depth: Number(w.depth) || 64,
+          maxHeight: Number(w.maxHeight) || 20,
+          waterLevel: Number(w.waterLevel) || 6,
+          deltas,
+        });
         if (typeof window !== "undefined" && window.__voxelDebug) {
           window.__voxelDebug.push("worldSync:backfill", {
-            seed: cached.seed,
-            width: cached.width,
-            depth: cached.depth,
+            seed, width: w.width, depth: w.depth, maxHeight: w.maxHeight,
+            initialDeltas: deltas.length,
           });
         }
-      } catch (err) {
-        if (this._debug) console.warn("[WorldSync] backfill failed", err);
+      } else if (typeof window !== "undefined" && window.__voxelDebug) {
+        window.__voxelDebug.push("worldSync:backfill", {
+          miss: "no state.world.seed (state present? " + !!state + ")",
+        });
       }
-    } else if (typeof window !== "undefined" && window.__voxelDebug) {
-      window.__voxelDebug.push("worldSync:backfill", { miss: "no cached seed" });
+    } catch (err) {
+      if (this._debug) console.warn("[WorldSync] schema backfill failed", err);
     }
   }
 
