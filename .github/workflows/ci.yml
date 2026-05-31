@@ -1,0 +1,83 @@
+name: ci
+
+# Continuous integration. Every push to main and every PR triggers:
+#   1. typecheck (server, web, shared)
+#   2. build (server bundle, web Next.js, game Vite)
+#   3. self-check suite against the deployed production stack
+#
+# The self-check suite (server-multiplayer + ui-game-physics) talks to
+# Render + Vercel over the wire. It does NOT spin up a local server, so
+# the contract under test is exactly what real players see. This catches
+# regressions in deploys that local tests would miss.
+#
+# Tests run on Ubuntu 24.04, Node 20. Each suite has its own timeout to
+# avoid hanging the whole workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {} # manual trigger from the Actions tab
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (shared + server + web)
+        run: pnpm typecheck
+
+      - name: Build (server + web + game)
+        run: pnpm build
+
+      - name: Install Playwright browsers
+        run: pnpm dlx playwright install --with-deps chromium
+
+      - name: Self-check — server multiplayer (raw Colyseus, 2 clients)
+        timeout-minutes: 3
+        run: node tests/server-multiplayer.mjs
+
+      - name: Self-check — feature behavior (chase / drift / late join / world sync)
+        timeout-minutes: 3
+        run: node tests/behavior-multiplayer.mjs
+
+      - name: Self-check — UI + game physics (Playwright)
+        timeout-minutes: 5
+        run: node tests/ui-game-physics.mjs
+        env:
+          # Vercel can take ~30s to wake up the lobby on a cold deploy. The
+          # suite has its own per-check timeout but we give the runner some
+          # slack for the first request.
+          CI: "true"
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: |
+            screenshots/
+          if-no-files-found: ignore

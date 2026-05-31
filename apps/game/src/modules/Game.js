@@ -322,6 +322,9 @@ export class Game {
 
   start() {
     this.renderer.setAnimationLoop(() => this.tick());
+    if (typeof window !== 'undefined') {
+      window.__voxelGame = this;
+    }
   }
 
   tick() {
