@@ -134,20 +134,26 @@ export class Game {
         this._worldSync = new WorldSync(this.world, bridge, {
           onWorldRebuilt: () => {
             if (!this.player || typeof this.player.setPosition !== 'function') return;
-            // The server stores all players at PLAYER_SPAWN_Y (a flat 1.0)
-            // and a default XZ — it has no terrain knowledge. The upstream
-            // world is procedurally terraced (meadow, snowland) so trusting
-            // the server's spawn would bury us or float us. Use the same
-            // deterministic getSpawnPoint() the singleplayer flow uses —
-            // because every client regenerates from the SAME server seed,
-            // every client lands at the SAME spawn point AND it sits exactly
-            // on terrain. CSP reconciles our position to the server on the
-            // first input frame.
-            const [sx, sy, sz] = this.world.getSpawnPoint().toArray();
-            this.player.setPosition(sx, sy, sz);
+            // The default getSpawnPoint() drops players AT (0,0,0) which on
+            // the meadow map is INSIDE the central castle (walls of stone
+            // around them, south gate is the only way out). The user can't
+            // see the enemies that spawn around the castle's outside walls
+            // because the walls block line of sight. In MP we pick a spot
+            // OUTSIDE the castle so the player lands on open grass with the
+            // castle visible north of them. Every client regenerates the
+            // same procedural world from the server's seed, so every client
+            // lands at the same spot.
+            const safeX = 0;
+            const safeZ = 18; // ~10 blocks south of the south gate (castleHalf=8)
+            const surfaceY = (typeof this.world.getSurfaceY === 'function')
+              ? this.world.getSurfaceY(safeX, safeZ)
+              : null;
+            const sy = (Number.isFinite(surfaceY) ? surfaceY : 8) + 2.2;
+            this.player.setPosition(safeX + 0.5, sy, safeZ + 0.5);
             if (typeof window !== 'undefined' && window.__voxelDebug) {
-              window.__voxelDebug.push('player:spawn:terrain', {
-                x: sx, y: sy, z: sz,
+              window.__voxelDebug.push('player:spawn:mp', {
+                x: safeX + 0.5, y: sy, z: safeZ + 0.5,
+                surfaceY,
               });
             }
           },
@@ -851,7 +857,11 @@ export class Game {
     }
     // Debug: P clears the round's enemies, jumping to the next wave. Once the
     // run is won, P instead drops you into a training ground of static zombies.
-    if (this.input.consume('debugSkipWave')) {
+    // In multiplayer the server is the wave director — clearing the local
+    // managers here would wipe the server-pushed visuals while the server
+    // keeps the enemies alive in its state. So we just ignore P entirely in
+    // MP; the host can use the lobby/ReadyNextWave path if we add a UI for it.
+    if (this.input.consume('debugSkipWave') && !this.network) {
       if (this.victory) {
         this.enterTrainingGround();
       } else {
@@ -902,8 +912,10 @@ export class Game {
       + this.witches.consumeKills() * BALANCE.coins.witch;
 
     // Between waves: a visible 5s countdown, then the next wave. The final wave
-    // goes straight to victory (no next wave to count down to).
-    if (!this.victory && this.state === 'playing') {
+    // goes straight to victory (no next wave to count down to). In MP the
+    // server's checkWaveProgression already handles this — running it here
+    // too would race the server and stack countdowns on a stale local view.
+    if (!this.victory && this.state === 'playing' && !this.network) {
       if (this.enemies.aliveCount() === 0) {
         if (this.wave >= this.waveCount) {
           this.advanceWave();
