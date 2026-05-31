@@ -1,7 +1,10 @@
 import { Room, Client } from "@colyseus/core";
 import {
   BLOCK_INTERACTION_RANGE,
+  COINS_BALANCE,
   DEFAULT_WAVE_COUNT,
+  DRAGON_BALANCE,
+  FIREBALL_COLLISION_RADIUS,
   GAME_ROOM_NAME,
   LobbyClientMessage,
   LobbyServerMessage,
@@ -10,6 +13,7 @@ import {
   PLAYER_MAX_DELTA,
   PLAYER_SPAWN_Y,
   PLAYER_SPEED,
+  PROJECTILE_LIFETIME_S,
   ServerMessage,
   SHOP_DURATION_MS,
   TICK_INTERVAL_MS,
@@ -21,6 +25,7 @@ import {
   WORLD_WATER_LEVEL,
   WORLD_WIDTH,
 } from "@mvp/shared";
+import { FireballState } from "../schema/FireballState.js";
 import { GameState } from "../schema/GameState.js";
 import { VoxelPlayer } from "../schema/VoxelPlayer.js";
 import {
@@ -30,6 +35,12 @@ import {
   tickWitch,
   tickZombie,
 } from "../systems/EnemyAI.js";
+import {
+  allocFireballId,
+  isFinalWave,
+  isWaveCleared,
+  spawnWave,
+} from "../systems/WaveDirector.js";
 import { mulberry32, pickSeed } from "../systems/WorldSeed.js";
 import { generateRoomCode } from "../utils/roomCode.js";
 import { isValidName, sanitizeName } from "../utils/validators.js";
@@ -135,6 +146,26 @@ export class GameRoom extends Room<GameState> {
    * cleared on transition or on host disconnect.
    */
   private _pendingStartAt = 0;
+
+  /**
+   * Per-dragon cooldown until the next fireball spawn (seconds). We use a
+   * Map keyed by the dragon id so the dragon schema stays lean and we avoid
+   * leaking memory: entries are wiped in {@link clearWaveEntities}.
+   */
+  private dragonFireCooldown = new Map<string, number>();
+
+  /**
+   * Per-dragon orbit phase (radians). Mirrors how the single-player dragon
+   * sweeps a circle around the origin; persisted between ticks so dragons
+   * don't snap.
+   */
+  private dragonOrbitPhase = new Map<string, number>();
+
+  /**
+   * Cached player views, refreshed once per tick. Hands a stable array to
+   * the AI ticks so they don't re-walk the MapSchema per-enemy.
+   */
+  private playerViewsCache: { x: number; y: number; z: number; alive: boolean }[] = [];
 
   maxClients = MAX_PLAYERS_PER_ROOM;
 
@@ -636,9 +667,28 @@ export class GameRoom extends Room<GameState> {
 
     if (this.state.phase === "playing") {
       this.tickPlayers(dt);
+      // Refresh the player views cache once per tick — AI ticks read it many
+      // times (once per enemy/dragon) but the player set rarely changes.
+      this.refreshPlayerViewsCache();
       this.tickEnemies(dt);
+      this.tickDragons(dt);
       this.tickFireballs(dt);
+      this.checkWaveProgression();
     }
+  }
+
+  /** Rebuild {@link playerViewsCache} from the current MapSchema. */
+  private refreshPlayerViewsCache(): void {
+    const out: { x: number; y: number; z: number; alive: boolean }[] = [];
+    this.state.players.forEach((p) => {
+      out.push({
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        alive: p.alive && p.connected,
+      });
+    });
+    this.playerViewsCache = out;
   }
 
   private tickPlayers(dt: number): void {
@@ -714,7 +764,7 @@ export class GameRoom extends Room<GameState> {
     if (this.state.enemies.size === 0) return;
 
     const ctx: AIContext = {
-      players: this.iterPlayerViews(),
+      players: this.playerViewsCache,
       blockAt: (x, y, z) => this.blockAt(x, y, z),
     };
 
@@ -736,29 +786,379 @@ export class GameRoom extends Room<GameState> {
 
       if (ev) {
         this.broadcast(VoxelServerMessage.EnemyEvent, {
-          id: enemy.id,
-          kind: ev.kind,
+          enemyId: enemy.id,
+          event: ev.kind,
           ...("target" in ev ? { target: ev.target } : {}),
         });
       }
     });
   }
 
-  /** Dragon fireballs. Phase 1 only decrements `life` and despawns. */
+  /**
+   * Minimal dragon AI: orbit the origin at altitude, lob a fireball at the
+   * nearest alive player every {@link DRAGON_BALANCE.attackCooldownMin}..max
+   * seconds. Numeric ops only — no Vector3 allocation per tick.
+   */
+  private tickDragons(dt: number): void {
+    if (this.state.dragons.size === 0) return;
+
+    const players = this.playerViewsCache;
+    const minAlt = DRAGON_BALANCE.minAltitude ?? 13;
+    const maxAlt = DRAGON_BALANCE.maxAltitude ?? 22;
+    const baseR = DRAGON_BALANCE.spawnRadius ?? 34;
+    const cooldownMin = DRAGON_BALANCE.attackCooldownMin ?? 1.35;
+    const cooldownMax = DRAGON_BALANCE.attackCooldownMax ?? 3.2;
+
+    this.state.dragons.forEach((dragon, id) => {
+      // Update orbit phase: ω = baseSpeed + aggression scaling.
+      const omega =
+        (DRAGON_BALANCE.baseSpeed ?? 0.24) +
+        dragon.aggression * (DRAGON_BALANCE.orbitPressure ?? 0.35);
+      const phase = (this.dragonOrbitPhase.get(id) ?? 0) + omega * dt;
+      this.dragonOrbitPhase.set(id, phase);
+
+      const radius = baseR;
+      const cx = Math.cos(phase) * radius;
+      const cz = Math.sin(phase) * radius;
+      dragon.x = cx;
+      dragon.z = cz;
+
+      // Gentle bob between minAlt..maxAlt.
+      const bobT = (this.state.tick / 20) * (DRAGON_BALANCE.bobSpeed ?? 2.5);
+      const bobAmp = DRAGON_BALANCE.bobAmplitude ?? 1.6;
+      const baseY = (minAlt + maxAlt) * 0.5;
+      dragon.y = baseY + Math.sin(bobT) * bobAmp;
+
+      // Face the orbit tangent (toward where the dragon is flying next).
+      dragon.rotationY = Math.atan2(-Math.sin(phase), Math.cos(phase));
+
+      // Fireball cooldown.
+      let cd = this.dragonFireCooldown.get(id);
+      if (cd === undefined) {
+        cd = cooldownMin + this.rand() * Math.max(0, cooldownMax - cooldownMin);
+        this.dragonFireCooldown.set(id, cd);
+      }
+      cd -= dt;
+      if (cd > 0) {
+        this.dragonFireCooldown.set(id, cd);
+        return;
+      }
+
+      // Pick a target — nearest alive player.
+      let target: { x: number; y: number; z: number } | null = null;
+      let bestDistSq = Infinity;
+      for (const p of players) {
+        if (!p.alive) continue;
+        const dx = p.x - dragon.x;
+        const dy = p.y - dragon.y;
+        const dz = p.z - dragon.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < bestDistSq) {
+          bestDistSq = d2;
+          target = { x: p.x, y: p.y, z: p.z };
+        }
+      }
+
+      // Reset cooldown for next shot.
+      this.dragonFireCooldown.set(
+        id,
+        cooldownMin + this.rand() * Math.max(0, cooldownMax - cooldownMin),
+      );
+
+      if (!target) return;
+
+      // Aim the fireball toward the player's torso.
+      const aimX = target.x - dragon.x;
+      const aimY = target.y + 1.3 - dragon.y;
+      const aimZ = target.z - dragon.z;
+      const len = Math.hypot(aimX, aimY, aimZ);
+      if (len < 1e-4) return;
+      const speed = DRAGON_BALANCE.fireballSpeed ?? 24;
+
+      const fb = new FireballState();
+      fb.id = allocFireballId();
+      fb.x = dragon.x;
+      fb.y = dragon.y;
+      fb.z = dragon.z;
+      fb.vx = (aimX / len) * speed;
+      fb.vy = (aimY / len) * speed;
+      fb.vz = (aimZ / len) * speed;
+      fb.ownerId = dragon.id;
+      fb.damage = DRAGON_BALANCE.fireballDamage ?? 14;
+      fb.life = DRAGON_BALANCE.fireballLife ?? PROJECTILE_LIFETIME_S;
+      this.state.fireballs.set(fb.id, fb);
+
+      this.broadcast(VoxelServerMessage.DragonFireball, {
+        fireball: {
+          id: fb.id,
+          x: fb.x,
+          y: fb.y,
+          z: fb.z,
+          vx: fb.vx,
+          vy: fb.vy,
+          vz: fb.vz,
+          ownerId: fb.ownerId,
+          damage: fb.damage,
+        },
+        kind: "spawn",
+      });
+    });
+  }
+
+  /**
+   * Advance fireballs, decrement life, and despawn on player hit or expiry.
+   * Player damage applied directly to {@link VoxelPlayer.health}; the Phase 5
+   * hit pipeline will route this through a Damage broadcast.
+   */
   private tickFireballs(dt: number): void {
     if (this.state.fireballs.size === 0) return;
 
+    const radius = FIREBALL_COLLISION_RADIUS;
+    const radiusSq = radius * radius;
     const expired: string[] = [];
+
     this.state.fireballs.forEach((fb, id) => {
       fb.x += fb.vx * dt;
       fb.y += fb.vy * dt;
       fb.z += fb.vz * dt;
       fb.life -= dt;
-      if (fb.life <= 0) expired.push(id);
+
+      if (fb.life <= 0) {
+        expired.push(id);
+        return;
+      }
+
+      // Player collision — torso center at y+1.0.
+      let hit = false;
+      this.state.players.forEach((p) => {
+        if (hit) return;
+        if (!p.alive || !p.connected) return;
+        const dx = p.x - fb.x;
+        const dy = p.y + 1.0 - fb.y;
+        const dz = p.z - fb.z;
+        if (dx * dx + dy * dy + dz * dz <= radiusSq) {
+          hit = true;
+          const dmg = fb.damage;
+          // Shield first, then health.
+          let remain = dmg;
+          if (p.shield > 0) {
+            const absorbed = Math.min(p.shield, remain);
+            p.shield -= absorbed;
+            remain -= absorbed;
+          }
+          if (remain > 0) p.health = Math.max(0, p.health - remain);
+          if (p.health <= 0 && p.alive) {
+            p.alive = false;
+            this.broadcast(VoxelServerMessage.PlayerDeath, {
+              sessionId: p.id,
+            });
+          } else {
+            this.broadcast(VoxelServerMessage.Damage, {
+              victimId: `player:${p.id}`,
+              amount: dmg,
+              hp: p.health,
+              shield: p.shield,
+            });
+          }
+        }
+      });
+
+      if (hit) expired.push(id);
     });
+
     for (const id of expired) {
+      const fb = this.state.fireballs.get(id);
+      if (fb) {
+        this.broadcast(VoxelServerMessage.DragonFireball, {
+          fireball: {
+            id: fb.id,
+            x: fb.x,
+            y: fb.y,
+            z: fb.z,
+            vx: fb.vx,
+            vy: fb.vy,
+            vz: fb.vz,
+            ownerId: fb.ownerId,
+            damage: fb.damage,
+          },
+          kind: "despawn",
+        });
+      }
       this.state.fireballs.delete(id);
     }
+  }
+
+  /**
+   * If the current wave is cleared, advance to the next wave or end the run.
+   * Only fires while `phase === 'playing'`.
+   */
+  private checkWaveProgression(): void {
+    if (this.state.phase !== "playing") return;
+    if (!isWaveCleared(this.state)) return;
+
+    // Wave just finished. If this was the last wave, broadcast WaveEnd and
+    // end the run; otherwise spawn the next wave.
+    if (isFinalWave(this.state.wave)) {
+      this.state.phase = "dead";
+      this.broadcast(VoxelServerMessage.WaveEnd, {
+        wave: this.state.wave,
+        runComplete: true,
+        victory: true,
+      });
+      return;
+    }
+
+    const next = (this.state.wave + 1) & 0xffff;
+    this.state.wave = next;
+    this.broadcast(VoxelServerMessage.WaveStart, {
+      wave: next,
+      totalWaves: this.state.totalWaves,
+    });
+    this.spawnCurrentWave();
+  }
+
+  /** Spawn enemies for `state.wave` and broadcast an EnemySpawn snapshot. */
+  private spawnCurrentWave(): void {
+    const wave = this.state.wave || 1;
+    const ids = spawnWave(this.state, wave, this.rand);
+
+    // Optional EnemySpawn snapshot — clients receive enemies via schema sync,
+    // but the explicit message lets them trigger spawn FX in one batch.
+    const snapshots: {
+      id: string;
+      kind: string;
+      x: number;
+      y: number;
+      z: number;
+      rotationY: number;
+      health: number;
+      maxHealth: number;
+      flags: number;
+    }[] = [];
+    for (const id of ids.enemies) {
+      const e = this.state.enemies.get(id);
+      if (!e) continue;
+      snapshots.push({
+        id: e.id,
+        kind: e.kind,
+        x: e.x,
+        y: e.y,
+        z: e.z,
+        rotationY: e.rotationY,
+        health: e.health,
+        maxHealth: e.maxHealth,
+        flags: e.flags,
+      });
+    }
+    if (snapshots.length > 0) {
+      this.broadcast(VoxelServerMessage.EnemySpawn, { enemies: snapshots });
+    }
+
+    console.log(
+      `[GameRoom ${this.state.roomCode}] wave=${wave} spawned enemies=${ids.enemies.length} dragons=${ids.dragons.length}`,
+    );
+  }
+
+  /**
+   * Apply damage to an enemy or dragon and award coins on kill. Exposed so
+   * the parallel WeaponFire hit-pipeline agent can call into it.
+   *
+   * @param targetId - "enemy:<id>" or "dragon:<id>" form.
+   * @param damage   - positive integer.
+   * @param attackerSessionId - optional, awarded coins on kill.
+   * @returns true if the target was killed by this hit.
+   */
+  applyDamage(
+    targetId: string,
+    damage: number,
+    attackerSessionId?: string,
+  ): boolean {
+    if (typeof damage !== "number" || !Number.isFinite(damage) || damage <= 0) {
+      return false;
+    }
+
+    if (targetId.startsWith("enemy:")) {
+      const id = targetId.slice("enemy:".length);
+      return this.damageEnemy(id, damage, attackerSessionId);
+    }
+    if (targetId.startsWith("dragon:")) {
+      const id = targetId.slice("dragon:".length);
+      return this.damageDragon(id, damage, attackerSessionId);
+    }
+    return false;
+  }
+
+  private damageEnemy(
+    id: string,
+    damage: number,
+    attackerSessionId?: string,
+  ): boolean {
+    const e = this.state.enemies.get(id);
+    if (!e) return false;
+    e.health = Math.max(0, e.health - damage);
+    if (e.health > 0) {
+      this.broadcast(VoxelServerMessage.Damage, {
+        victimId: `enemy:${id}`,
+        amount: damage,
+        hp: e.health,
+        shield: 0,
+      });
+      return false;
+    }
+    // Killed.
+    this.state.enemies.delete(id);
+    this.broadcast(VoxelServerMessage.EnemyDespawn, { enemyId: id });
+    this.awardCoins(attackerSessionId, coinsForKind(e.kind));
+    return true;
+  }
+
+  private damageDragon(
+    id: string,
+    damage: number,
+    attackerSessionId?: string,
+  ): boolean {
+    const d = this.state.dragons.get(id);
+    if (!d) return false;
+    d.health = Math.max(0, d.health - damage);
+    if (d.health > 0) {
+      this.broadcast(VoxelServerMessage.Damage, {
+        victimId: `dragon:${id}`,
+        amount: damage,
+        hp: d.health,
+        shield: 0,
+      });
+      return false;
+    }
+    // Killed.
+    this.state.dragons.delete(id);
+    this.dragonFireCooldown.delete(id);
+    this.dragonOrbitPhase.delete(id);
+    this.broadcast(VoxelServerMessage.EnemyDespawn, { enemyId: id });
+    this.awardCoins(attackerSessionId, COINS_BALANCE.dragon ?? 5);
+    return true;
+  }
+
+  private awardCoins(sessionId: string | undefined, amount: number): void {
+    if (!sessionId || amount <= 0) return;
+    const player = this.state.players.get(sessionId);
+    if (!player) return;
+    player.coins = (player.coins | 0) + amount;
+    this.broadcast(VoxelServerMessage.CoinsChange, {
+      sessionId,
+      coins: player.coins,
+    });
+  }
+
+  /**
+   * Tear down every transient entity from the previous wave. Called on a
+   * fresh playing transition so a re-started run doesn't inherit ghosts.
+   */
+  private clearWaveEntities(): void {
+    this.state.enemies.clear();
+    this.state.dragons.clear();
+    this.state.fireballs.clear();
+    this.dragonFireCooldown.clear();
+    this.dragonOrbitPhase.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -916,6 +1316,14 @@ export class GameRoom extends Room<GameState> {
       });
       this.state.wave = 1;
       this._pendingStartAt = 0;
+      // Reset any leftover entities (e.g. host re-started after a dead run)
+      // and spawn wave 1.
+      this.clearWaveEntities();
+      this.broadcast(VoxelServerMessage.WaveStart, {
+        wave: 1,
+        totalWaves: this.state.totalWaves,
+      });
+      this.spawnCurrentWave();
     }
   }
 }
@@ -923,6 +1331,13 @@ export class GameRoom extends Room<GameState> {
 function toInt(v: unknown): number | null {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
   return Math.trunc(v);
+}
+
+function coinsForKind(kind: string): number {
+  if (kind === "zombie") return COINS_BALANCE.zombie ?? 2;
+  if (kind === "skeleton") return COINS_BALANCE.skeleton ?? 3;
+  if (kind === "witch") return COINS_BALANCE.witch ?? 4;
+  return 1;
 }
 
 export { GAME_ROOM_NAME };
