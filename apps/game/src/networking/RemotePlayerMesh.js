@@ -23,6 +23,29 @@ import { SNAPSHOT_INTERPOLATION_DELAY_MS } from "@mvp/shared";
 const BUFFER_SIZE = 24;
 const DEFAULT_DELAY_MS = 120;
 
+// Y offset applied to the group every frame so the capsule's FEET line up
+// with the server-reported player.y (which represents the player's feet,
+// see PLAYER_SPAWN_Y in @mvp/shared and GameRoom.tickPlayers).
+//
+// CapsuleGeometry(radius=0.4, length=1.2) has its pivot at the GEOMETRIC
+// CENTER, so the capsule extends ±(length/2 + radius) = ±1.0 along Y. If we
+// placed the mesh at group.y = server.y the capsule's feet would render at
+// server.y - 1.0 — i.e. one block BELOW the surface the local player is
+// standing on. That's the visible "sunk into the ground" / "in the wrong
+// place" bug the user reported ("el personaje de mi amigo me sale en otro
+// sitio"). Adding the half-height to the group origin lifts the capsule so
+// that:
+//   feet  = group.y - 1.0 = server.y           ← matches local player's feet
+//   center = group.y      = server.y + 1.0
+//   head  = group.y + 1.0 = server.y + 2.0
+// The label sprite sits inside the group at local y=1.6 so it stays just
+// above the capsule head (world y = server.y + 2.6) — see _labelSprite below.
+//
+// Kept as a module-level constant: capsule dimensions are baked into the
+// geometry and don't change at runtime, so reading them from config would
+// only add noise.
+const VISUAL_Y_OFFSET = 1.0;
+
 // Per-character body tint so remotes are recognisable at a glance. Mirrors
 // the lobby's CharacterSelectStrip palette (loosely). Unknown ids fall back
 // to a neutral red so we never throw.
@@ -122,7 +145,10 @@ export class RemotePlayerMesh {
     this._bodyMesh = new THREE.Mesh(bodyGeom, this._bodyMaterial);
     this._bodyMesh.castShadow = true;
     this._bodyMesh.receiveShadow = false;
-    this._bodyMesh.position.y = 1.0; // half height so the capsule stands on y=0
+    // No local-Y offset here: the entire group is shifted by VISUAL_Y_OFFSET
+    // in update() so the capsule's feet land at server.y instead of
+    // server.y - 1.0 (which would visually bury the player into the ground).
+    this._bodyMesh.position.y = 0;
     this.group.add(this._bodyMesh);
 
     // Name label as a sprite. depthTest=false + renderOrder=10 means the
@@ -137,9 +163,12 @@ export class RemotePlayerMesh {
     });
     this._labelSprite = new THREE.Sprite(this._labelMaterial);
     this._labelSprite.scale.set(1.6, 0.4, 1);
-    // Top of the capsule body sits at body-local y = 2.0 (1.0 mesh offset +
-    // 1.0 half-height). 2.6 keeps a comfortable gap above the head.
-    this._labelSprite.position.y = 2.6;
+    // Body mesh is now centered at local y=0 (the VISUAL_Y_OFFSET lives on
+    // the group), so the capsule head sits at body-local y=1.0. 1.6 keeps a
+    // comfortable gap above the head; in world coords that's
+    // server.y + VISUAL_Y_OFFSET + 1.6 = server.y + 2.6, identical to the
+    // pre-fix label height.
+    this._labelSprite.position.y = 1.6;
     this._labelSprite.renderOrder = 10;
     this.group.add(this._labelSprite);
 
@@ -182,7 +211,7 @@ export class RemotePlayerMesh {
     // Before the oldest sample → snap to oldest.
     if (renderT <= buf[0].t) {
       const a = buf[0];
-      g.position.set(a.x, a.y, a.z);
+      g.position.set(a.x, a.y + VISUAL_Y_OFFSET, a.z);
       g.rotation.y = a.rotationY;
       return;
     }
@@ -191,7 +220,7 @@ export class RemotePlayerMesh {
     // visible overshoot when the next packet finally arrives.
     const newest = buf[buf.length - 1];
     if (renderT >= newest.t) {
-      g.position.set(newest.x, newest.y, newest.z);
+      g.position.set(newest.x, newest.y + VISUAL_Y_OFFSET, newest.z);
       g.rotation.y = newest.rotationY;
       return;
     }
@@ -204,7 +233,9 @@ export class RemotePlayerMesh {
     const alpha = span > 0 ? (renderT - a.t) / span : 0;
 
     g.position.x = a.x + (b.x - a.x) * alpha;
-    g.position.y = a.y + (b.y - a.y) * alpha;
+    // VISUAL_Y_OFFSET centers the capsule above the server-reported feet
+    // position (server.y is feet, capsule pivot is center → +1.0 half-height).
+    g.position.y = a.y + (b.y - a.y) * alpha + VISUAL_Y_OFFSET;
     g.position.z = a.z + (b.z - a.z) * alpha;
     g.rotation.y =
       a.rotationY + shortAngleDelta(a.rotationY, b.rotationY) * alpha;
