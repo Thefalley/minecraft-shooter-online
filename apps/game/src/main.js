@@ -128,9 +128,29 @@ async function startMultiplayer({ name, code, characterId, mode }) {
   }
 }
 
+// The Voxel-Dragons game is the multiplayer client. The proper entry point
+// is the lobby (apps/web) which creates/joins a room and redirects here with
+// ?code=…&name=…&mode=. If someone lands here without those params they're
+// taking a wrong turn — bounce them back to the lobby so the experience is
+// consistent.
+//
+// `?solo=1` is a debug escape hatch that keeps the imported singleplayer
+// menu reachable, useful for local dev and for verifying the original
+// Voxel-Dragons code still works after a refactor.
 const params = readJoinParams();
+const isSoloDebug = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('solo') === '1';
+  } catch {
+    return false;
+  }
+})();
+
 if (params.mode === 'create' || params.mode === 'join') {
   startMultiplayer(params);
-} else {
+} else if (isSoloDebug) {
   showMenu();
+} else {
+  const lobbyUrl = import.meta.env.VITE_LOBBY_URL || 'https://minecraft-shooter-online-web.vercel.app';
+  window.location.replace(lobbyUrl);
 }
