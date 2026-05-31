@@ -87,6 +87,9 @@ export class EnemySync {
     // server snapshots. Any pre-existing locally-spawned enemies are cleared
     // by setAuthority('server').
     this._setManagerAuthority("server");
+    if (typeof window !== "undefined" && window.__voxelDebug) {
+      window.__voxelDebug.push("enemySync:enable", { authority: "server" });
+    }
 
     const on = (event, fn) => {
       try {
@@ -119,9 +122,12 @@ export class EnemySync {
       const state = typeof this._bridge.getRoomState === "function"
         ? this._bridge.getRoomState()
         : null;
+      let backfilledEnemies = 0;
+      let backfilledDragons = 0;
       if (state) {
         state.enemies?.forEach?.((enemy, id) => {
           this._onEnemyUpsert({ id, enemy });
+          backfilledEnemies += 1;
         });
         state.dragons?.forEach?.((dragon, id) => {
           this._onEnemyUpsert({
@@ -135,6 +141,14 @@ export class EnemySync {
             health: dragon.health,
             maxHealth: dragon.maxHealth,
           });
+          backfilledDragons += 1;
+        });
+      }
+      if (typeof window !== "undefined" && window.__voxelDebug) {
+        window.__voxelDebug.push("enemySync:backfill", {
+          enemies: backfilledEnemies,
+          dragons: backfilledDragons,
+          stateAvailable: !!state,
         });
       }
     } catch (err) {

@@ -26,6 +26,40 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
+// Debug endpoint: dump a snapshot of a live room's state by code. Useful
+// when an external diagnostic (test harness, agent) needs to verify what
+// the authoritative state actually looks like — positions, enemy AI
+// state, world deltas. Read-only.
+app.get("/debug/rooms/:code", async (req, res) => {
+  const raw = req.params.code ?? "";
+  if (!isValidRoomCode(raw)) {
+    res.status(400).json({ error: "INVALID_CODE" });
+    return;
+  }
+  const code = normalizeRoomCode(raw);
+  try {
+    const rooms = await matchMaker.query({ name: GAME_ROOM_NAME });
+    const match = rooms.find((r) => r.metadata?.roomCode === code);
+    if (!match) {
+      res.status(404).json({ error: "ROOM_NOT_FOUND" });
+      return;
+    }
+    // matchMaker.remoteRoomCall would round-trip through the room actor.
+    // For a simple read we expose only the metadata-safe shape.
+    res.json({
+      roomId: match.roomId,
+      roomCode: code,
+      clients: match.clients,
+      maxClients: match.maxClients,
+      metadata: match.metadata,
+      hint: "Live state schema is not stringifiable over HTTP — use a Colyseus client to read state.",
+    });
+  } catch (err) {
+    console.error("[/debug/rooms]", err);
+    res.status(500).json({ error: "INTERNAL_ERROR" });
+  }
+});
+
 // Lookup endpoint: does a room with this code exist? Returns its roomId so the client can joinById.
 app.get("/rooms/by-code/:code", async (req, res) => {
   const raw = req.params.code ?? "";

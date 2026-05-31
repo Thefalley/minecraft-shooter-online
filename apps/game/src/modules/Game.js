@@ -244,7 +244,15 @@ export class Game {
     this.setupScene();
     this.bindEvents();
     this.onSelectionChanged();
-    this.startNextWave();
+    // Singleplayer bootstraps wave 1 here. Multiplayer leaves it to the
+    // server's WaveDirector — calling startNextWave() in MP would clear the
+    // server-broadcast enemies (via clearZombies()) and replace them with
+    // local-AI zombies that can't move because authority is 'server'.
+    if (!this.network) {
+      this.startNextWave();
+    } else {
+      this.wave = 1;
+    }
   }
 
   grantWaveAmmo() {
@@ -324,6 +332,57 @@ export class Game {
     this.renderer.setAnimationLoop(() => this.tick());
     if (typeof window !== 'undefined') {
       window.__voxelGame = this;
+      window.__voxelDebug = window.__voxelDebug ?? {
+        // ?debug=1 in the URL turns on verbose logging in the console AND
+        // a persistent ring buffer that automated diagnostics can read.
+        enabled: new URLSearchParams(window.location.search).get('debug') === '1',
+        ring: [], // last 500 events
+        push(category, payload) {
+          if (this.ring.length >= 500) this.ring.shift();
+          this.ring.push({ t: Date.now(), category, payload });
+          if (this.enabled) console.debug(`[vox:${category}]`, payload);
+        },
+        dump() {
+          // Snapshot of everything a debugger needs.
+          const g = window.__voxelGame;
+          const bridge = g?.network?.getBridge?.();
+          const state = bridge?.getRoomState?.();
+          return {
+            time: new Date().toISOString(),
+            session: bridge?.getSelfSessionId?.() ?? null,
+            phase: state?.phase ?? null,
+            wave: state?.wave ?? g?.wave ?? null,
+            playerPos: g?.player?.position
+              ? { x: g.player.position.x, y: g.player.position.y, z: g.player.position.z }
+              : null,
+            counts: {
+              statePlayers: state?.players?.size ?? null,
+              stateEnemies: state?.enemies?.size ?? null,
+              stateDragons: state?.dragons?.size ?? null,
+              localZombies: g?.zombies?.zombies?.length ?? null,
+              serverZombies: g?.zombies?._serverEntities?.size ?? null,
+              localSkeletons: g?.skeletons?.skeletons?.length ?? null,
+              serverSkeletons: g?.skeletons?._serverEntities?.size ?? null,
+              localWitches: g?.witches?.witches?.length ?? null,
+              serverWitches: g?.witches?._serverEntities?.size ?? null,
+              localDragons: g?.dragons?.dragons?.length ?? null,
+              serverDragons: g?.dragons?._serverEntities?.size ?? null,
+            },
+            authority: {
+              zombies: g?.zombies?._authority ?? null,
+              skeletons: g?.skeletons?._authority ?? null,
+              witches: g?.witches?._authority ?? null,
+              dragons: g?.dragons?._authority ?? null,
+            },
+            enemySync: {
+              created: !!g?._enemySync,
+              enabled: !!g?._enemySync?._enabled,
+            },
+            ring: this.ring.slice(-50),
+          };
+        },
+      };
+      window.__voxelDebug.push('game:start', { network: !!this.network });
     }
   }
 
@@ -571,6 +630,10 @@ export class Game {
   }
 
   advanceWave() {
+    // In multiplayer the server is the wave director — the client cannot
+    // unilaterally jump waves. Bail out so we don't clear/spawn local AI
+    // entities on top of the server-broadcast roster.
+    if (this.network) return;
     if (this.wave >= BALANCE.progression.waveCount) {
       this.triggerVictory();
       return;
