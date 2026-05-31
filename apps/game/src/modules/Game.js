@@ -417,13 +417,21 @@ export class Game {
       }
     }
 
+    // Player.update() must run FIRST in multiplayer too, because it now
+    // performs look() (mouse → camera rotation) before its authority guard.
+    // Without this, the camera wouldn't rotate in MP and the cmd built below
+    // would carry a stale rotationY.
+    this.player.update(delta, this.input, this.world);
+
     if (this.network && this.player && typeof this.player.buildInputCommand === 'function') {
+      // Now reads the freshly-rotated camera so the server sees what the
+      // player is actually looking at this tick.
       const cmd = this.player.buildInputCommand(this.input, delta);
       this.network.pushInput(cmd);
-      // CSP: Player.update() early-returns when networkAuthority='server'.
-      // Drive the same input pipeline locally so the player still moves at
-      // 60 Hz with zero perceived latency. The server snapshot reconciles via
-      // applyServerSnapshot() when it arrives.
+      // CSP: Player.update() early-returns inside its authority guard when
+      // networkAuthority='server', so we drive the movement pipeline here.
+      // The server snapshot reconciles via applyServerSnapshot() when it
+      // arrives.
       if (typeof this.player.applyInput === 'function' && this.player.networkAuthority === 'server') {
         this.player.applyInput(cmd, delta, this.world);
         if (typeof this.player.recordSnapshot === 'function') {
@@ -431,7 +439,6 @@ export class Game {
         }
       }
     }
-    this.player.update(delta, this.input, this.world);
     this.clampPlayerToBounds();
     this.world.update(delta);
     if (this.mage) this.mage.update(delta); // before enemies so the tornado can lift them
