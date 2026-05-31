@@ -1,0 +1,28 @@
+# Normalize line endings to LF on all platforms (avoids CRLF churn on Windows).
+# Mirrors EHxuban11/Voxel-Dragons so the upstream merges cleanly and Linux CI
+# never trips over a CR injected by Git for Windows' core.autocrlf.
+* text=auto eol=lf
+
+# Shell scripts must keep LF endings or they fail on the Linux runner.
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.js   text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# Binary assets must not be line-ending normalized.
+*.ttf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.zip binary
+*.mca binary
+*.wasm binary
+*.ico binary

@@ -70,6 +70,7 @@ export const VoxelServerMessage = {
   DragonFireball: "vs:dragon:fireball",
   WeaponHit: "vs:weapon:hit",
   WeaponMiss: "vs:weapon:miss",
+  WeaponFired: "vs:weapon:fired",
   WeaponReloadComplete: "vs:weapon:reloadDone",
   AmmoChange: "vs:ammo",
   Damage: "vs:damage",
@@ -133,6 +134,25 @@ export interface WeaponHitPayload {
 export interface WeaponMissPayload {
   seq: number;
   shotId: string;
+}
+
+/**
+ * Broadcast to ALL clients (including the shooter) whenever the server
+ * accepts a WeaponFire intent. Other clients use this to render visual
+ * tracers / muzzle flashes for remote shots. The shooter typically dedupes
+ * by comparing `shooterSessionId` against their own session id (the local
+ * tracer already played client-side).
+ */
+export interface WeaponFiredPayload {
+  shooterSessionId: string;
+  slotIndex: number;
+  origin: [number, number, number];
+  direction: [number, number, number];
+  /**
+   * Weapon id (e.g. "rifle", "shotgun", "blaster", "pistol", "dagger") so
+   * the client can look up tracer color without re-mapping slotIndex.
+   */
+  slot?: string;
 }
 
 export interface AbilityUsePayload {

@@ -393,6 +393,10 @@ export class NetworkBridge {
       return p;
     });
     onMsg(mkey(V, "WeaponMiss", "server:weapon:miss"), "weaponMiss");
+    // Broadcast of every accepted WeaponFire intent. Used so remote players
+    // see other clients' tracers / muzzle flashes (the shooter dedupes via
+    // shooterSessionId === selfSessionId).
+    onMsg(mkey(V, "WeaponFired", "vs:weapon:fired"), "weaponFired");
     onMsg(
       mkey(V, "WeaponReloadComplete", "server:weapon:reloadComplete"),
       "weaponReloadComplete",

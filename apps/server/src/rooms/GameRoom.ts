@@ -688,6 +688,18 @@ export class GameRoom extends Room<GameState> {
     const ndy = direction[1] / dirLen;
     const ndz = direction[2] / dirLen;
 
+    // ── Broadcast the fired event to ALL clients so remote players can
+    // render the tracer / muzzle flash for this shot. Done after origin /
+    // direction validation but before lag-comp / raycast so a long hit
+    // resolution never delays the visual. Shooter dedupes by sessionId.
+    this.broadcast(VoxelServerMessage.WeaponFired, {
+      shooterSessionId: client.sessionId,
+      slotIndex,
+      origin: [origin[0], origin[1], origin[2]],
+      direction: [ndx, ndy, ndz],
+      slot: weapon.id,
+    });
+
     // Reject shots whose origin is wildly far from the shooter's authoritative
     // position. This is a cheap cheat-guard, not a precise eye-position check.
     const oDx = origin[0] - shooter.x;

@@ -248,6 +248,14 @@ export class Game {
           skeletons: this.skeletons,
           witches: this.witches,
           dragons: this.dragons,
+          // Fire the same "killed" cinematic (explosion + sound) on every
+          // client when the server confirms a despawn — not only the
+          // shooter, whose local raycast no longer mutates HP in MP.
+          onKill: (pos, id, kind) => {
+            this.effects?.explosion?.(pos);
+            this.audio?.explosion?.();
+            window.__voxelDebug?.push?.('enemy:kill:client', { id, kind, x: pos.x, y: pos.y, z: pos.z });
+          },
         });
         this._enemySync.enable();
 
@@ -280,6 +288,46 @@ export class Game {
         };
         try { this._netUnsubs.push(enemyBridge.on('waveStart', onWaveStart)); } catch { /* ignore */ }
         try { this._netUnsubs.push(enemyBridge.on('waveCinematic', onWaveCinematic)); } catch { /* ignore */ }
+
+        // Remote-tracer broadcast. The server re-broadcasts every accepted
+        // WeaponFire intent to every connected client so non-shooters can
+        // render a tracer / muzzle flash for the shot. The shooter dedupes
+        // by sessionId — their local Weapons.js already emitted onTracer.
+        const onWeaponFired = (p) => {
+          if (!p || !this.effects || !Array.isArray(p.origin) || !Array.isArray(p.direction)) return;
+          // Dedupe local echo — the shooter already drew their own tracer.
+          const selfSessionId = enemyBridge.getSelfSessionId?.();
+          if (p.shooterSessionId && selfSessionId && p.shooterSessionId === selfSessionId) return;
+
+          // Resolve weapon entry → tracer color. Prefer the explicit `slot`
+          // id from the payload; fall back to slotIndex mapping if absent.
+          let weapon = null;
+          const weapons = Array.isArray(BALANCE?.weapons) ? BALANCE.weapons : [];
+          if (typeof p.slot === 'string') {
+            weapon = weapons.find((w) => w && w.id === p.slot) ?? null;
+          }
+          if (!weapon && Number.isInteger(p.slotIndex)) {
+            // Server slot order: 0 pistol, 1 shotgun, 2 rifle, 3 blaster, 4 dagger.
+            const ID_BY_SLOT = ['pistol', 'shotgun', 'rifle', 'blaster', 'dagger'];
+            const id = ID_BY_SLOT[p.slotIndex];
+            if (id) weapon = weapons.find((w) => w && w.id === id) ?? null;
+          }
+          const color = weapon?.tracerColor ?? weapon?.flashColor ?? 0xffe08a;
+          const range = Number.isFinite(weapon?.range) ? weapon.range : 50;
+
+          const ox = +p.origin[0], oy = +p.origin[1], oz = +p.origin[2];
+          const dx = +p.direction[0], dy = +p.direction[1], dz = +p.direction[2];
+          if (!Number.isFinite(ox) || !Number.isFinite(oy) || !Number.isFinite(oz)) return;
+          if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz)) return;
+          // Normalize direction defensively (server already does, but be safe).
+          const dlen = Math.hypot(dx, dy, dz);
+          if (dlen < 1e-4) return;
+          const nx = dx / dlen, ny = dy / dlen, nz = dz / dlen;
+          const originVec = new THREE.Vector3(ox, oy, oz);
+          const endVec = new THREE.Vector3(ox + nx * range, oy + ny * range, oz + nz * range);
+          try { this.effects.tracer(originVec, endVec, color); } catch { /* swallow */ }
+        };
+        try { this._netUnsubs.push(enemyBridge.on('weaponFired', onWeaponFired)); } catch { /* ignore */ }
       }
     }
 

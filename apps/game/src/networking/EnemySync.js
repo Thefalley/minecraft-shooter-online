@@ -2,6 +2,8 @@
 //
 // Bridges the local enemy managers (Zombie/Skeleton/Witch/Dragon) to the
 // authoritative server. Phase 4 client side.
+
+import * as THREE from 'three';
 //
 // In SINGLEPLAYER (no bridge), this is never enabled and the managers run
 // their local AI exactly as before.
@@ -70,15 +72,17 @@ export class EnemySync {
    *   skeletons?: any,
    *   witches?: any,
    *   dragons?: any,
+   *   onKill?: (position: import('three').Vector3, id: string|number, kind: string|null) => void,
    *   debug?: boolean,
    * }} opts
    */
-  constructor({ bridge, zombies, skeletons, witches, dragons, debug = false } = {}) {
+  constructor({ bridge, zombies, skeletons, witches, dragons, onKill, debug = false } = {}) {
     this._bridge = bridge ?? null;
     this._zombies = zombies ?? null;
     this._skeletons = skeletons ?? null;
     this._witches = witches ?? null;
     this._dragons = dragons ?? null;
+    this._onKill = typeof onKill === 'function' ? onKill : null;
     this._debug = !!debug;
     this._unsubs = [];
     this._enabled = false;
@@ -238,6 +242,37 @@ export class EnemySync {
     if (id === undefined || id === null) return;
     if (typeof window !== "undefined" && window.__voxelDebug) {
       window.__voxelDebug.push("enemy:despawn", { id });
+    }
+    // Before tearing down meshes, look up which manager owns this id and
+    // capture the entity's current world position + kind. This lets the
+    // host fire the same "killed" cinematic (explosion + sound) on every
+    // client, not just the one whose local raycast saw the killing blow.
+    let killPosition = null;
+    let killKind = null;
+    if (this._onKill) {
+      const managers = [
+        { mgr: this._zombies, kind: "zombie" },
+        { mgr: this._skeletons, kind: "skeleton" },
+        { mgr: this._witches, kind: "witch" },
+        { mgr: this._dragons, kind: "dragon" },
+      ];
+      for (const { mgr, kind } of managers) {
+        if (!mgr || !mgr._serverEntities) continue;
+        const entity = mgr._serverEntities.get(id);
+        if (entity && entity.mesh && entity.mesh.position) {
+          killPosition = new THREE.Vector3(
+            entity.mesh.position.x,
+            entity.mesh.position.y,
+            entity.mesh.position.z,
+          );
+          killKind = kind;
+          break;
+        }
+      }
+      if (killPosition) {
+        try { this._onKill(killPosition, id, killKind); }
+        catch (err) { if (this._debug) console.warn("[EnemySync] onKill", err); }
+      }
     }
     // We don't always know the kind on despawn — try every manager that
     // tracks this id. removeServerEnemy returns falsy if it doesn't own it.

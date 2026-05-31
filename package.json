@@ -25,6 +25,7 @@
     "test:behavior": "node tests/behavior-multiplayer.mjs",
     "test:sync": "node tests/sync-rate.mjs",
     "test:logs": "node tests/log-equivalence.mjs",
+    "test:multikill": "node tests/multi-client-kill.mjs",
     "test:ui": "node tests/ui-game-physics.mjs",
     "test:all": "node tests/all.mjs",
     "clean": "pnpm -r exec rm -rf dist .next node_modules && rm -rf node_modules"
