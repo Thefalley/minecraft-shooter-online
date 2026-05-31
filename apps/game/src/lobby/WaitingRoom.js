@@ -277,6 +277,13 @@ export class WaitingRoom {
     if (typeof state.hostSessionId === "string") {
       this._hostSessionId = state.hostSessionId;
     }
+
+    // Late-joiner detection: if the room is already past 'lobby' by the time
+    // we mount, this player joined mid-game. We hold them at the lobby with
+    // a manual "Entrar a la partida" button + character select, rather than
+    // auto-dropping into the scene as soon as PhaseChange arrives.
+    const initialPhase = typeof state.phase === "string" ? state.phase : "lobby";
+    this._isLateJoiner = initialPhase !== "lobby";
   }
 
   // ── Bridge wiring ────────────────────────────────────────────────────────
@@ -391,11 +398,28 @@ export class WaitingRoom {
     if (!payload) return;
     const to = payload.to ?? payload.phase ?? null;
     if (to !== "playing") return;
-    // Notify the parent first — they own the actual game boot. Then tear down.
+    // Late joiner: don't auto-drop into the game. The user needs a moment
+    // to see what room they're in, who's there, and pick a character. The
+    // "Entrar a la partida" button in _renderActions completes the entry.
+    if (this._isLateJoiner) {
+      this._renderActions();
+      return;
+    }
+    // Normal flow (player was in lobby, host started): notify parent then
+    // tear down.
     try {
       this.opts.onStart?.();
     } catch (err) {
-      // Don't trap the consumer's exception inside the lobby; surface to console.
+      console.error("[WaitingRoom] onStart threw", err);
+    }
+    this.hide();
+  }
+
+  /** Late-joiner only: user clicked "Entrar a la partida". Notify + dismiss. */
+  _onEnterClick() {
+    try {
+      this.opts.onStart?.();
+    } catch (err) {
       console.error("[WaitingRoom] onStart threw", err);
     }
     this.hide();
@@ -521,6 +545,23 @@ export class WaitingRoom {
       }
     });
     actions.appendChild(leave);
+
+    // Late joiner — game is already in progress. Show "Entrar a la partida"
+    // so the user can read the room + pick character at their own pace.
+    if (this._isLateJoiner) {
+      const note = document.createElement("div");
+      note.className = "vd-lobby-wait";
+      note.textContent = "Partida en curso · elige tu personaje";
+      actions.appendChild(note);
+
+      const enter = document.createElement("button");
+      enter.type = "button";
+      enter.className = "vd-lobby-start";
+      enter.textContent = "Entrar a la partida";
+      enter.addEventListener("click", () => this._onEnterClick());
+      actions.appendChild(enter);
+      return;
+    }
 
     const isHost = this._isLocalHost();
     if (isHost) {
