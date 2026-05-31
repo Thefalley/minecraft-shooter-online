@@ -51,7 +51,7 @@ export function LobbyForm(): JSX.Element {
   const error = localError ?? errorFromStore;
   const trimmedName = useMemo(() => name.trim(), [name]);
 
-  const handleCreate = useCallback(async () => {
+  const handleCreate = useCallback(() => {
     const validation = validateName(name);
     if (validation) {
       setLocalError(validation);
@@ -59,22 +59,15 @@ export function LobbyForm(): JSX.Element {
     }
     setLocalError(null);
     setError(null);
-    try {
-      await createRoom(trimmedName);
-      // Hand off cleanly: drop the lobby's demo connection, then go to the
-      // standalone Voxel-Dragons app where character selection happens.
-      try {
-        await getTransport().leave();
-      } catch {
-        /* ignore — we're leaving the page anyway */
-      }
-      redirectToGame("create");
-    } catch {
-      // store-level error already populated
-    }
-  }, [name, trimmedName, createRoom, redirectToGame, setError]);
+    // The lobby no longer pre-creates the Colyseus room. Doing so caused a
+    // race where the lobby's room would get disposed (10 s allowReconnection)
+    // before apps/game could joinByCode, leading to ROOM_NOT_FOUND. Instead
+    // we let apps/game CREATE the room itself — its NetworkBridge will get
+    // back the authoritative code which the WaitingRoom shows to the host.
+    redirectToGame("create");
+  }, [name, redirectToGame, setError]);
 
-  const handleJoin = useCallback(async () => {
+  const handleJoin = useCallback(() => {
     const validation = validateName(name);
     if (validation) {
       setLocalError(validation);
@@ -86,18 +79,11 @@ export function LobbyForm(): JSX.Element {
     }
     setLocalError(null);
     setError(null);
-    try {
-      await joinRoomByCode(trimmedName, code);
-      try {
-        await getTransport().leave();
-      } catch {
-        /* ignore — we're leaving the page anyway */
-      }
-      redirectToGame("join");
-    } catch {
-      // store-level error already populated
-    }
-  }, [name, trimmedName, code, joinRoomByCode, redirectToGame, setError]);
+    // Same handoff philosophy: apps/game performs the joinByCode itself.
+    // We carry the code (typed into the form) in the URL so its UrlParams
+    // reader picks it up.
+    redirectToGame("join", code);
+  }, [name, code, redirectToGame, setError]);
 
   return (
     <div className="lobby">

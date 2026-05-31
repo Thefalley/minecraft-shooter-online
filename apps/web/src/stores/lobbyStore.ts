@@ -5,17 +5,13 @@ import type { ConnectionStatus } from "@mvp/shared";
 import { getTransport } from "@/networking/colyseusTransport";
 
 function buildGameUrl(
-  roomCode: string,
+  roomCode: string | null,
   name: string,
   mode: "create" | "join"
 ): string {
-  // Production fallback: if NEXT_PUBLIC_GAME_URL isn't configured (we haven't
-  // deployed apps/game to its own Vercel yet), hand off to the legacy /play
-  // route on the SAME origin. That's the R3F cubes-on-plane MVP that has
-  // worked since v0.1.0 and is built into apps/web. The Voxel-Dragons app
-  // takes over only once GAME_URL is set on the deploy.
   const explicit = process.env.NEXT_PUBLIC_GAME_URL;
-  const params = new URLSearchParams({ code: roomCode, name, mode });
+  const params = new URLSearchParams({ name, mode });
+  if (roomCode) params.set("code", roomCode);
   if (explicit) {
     return `${explicit.replace(/\/$/, "")}/?${params.toString()}`;
   }
@@ -36,7 +32,7 @@ type LobbyState = {
   createRoom: (name: string) => Promise<void>;
   joinRoomByCode: (name: string, code: string) => Promise<void>;
   leaveRoom: () => Promise<void>;
-  redirectToGame: (mode: "create" | "join") => void;
+  redirectToGame: (mode: "create" | "join", code?: string | null) => void;
 };
 
 export const useLobbyStore = create<LobbyState>((set, get) => ({
@@ -84,11 +80,14 @@ export const useLobbyStore = create<LobbyState>((set, get) => ({
     // Reset transient connection state but keep the chosen name.
     void get;
   },
-  redirectToGame(mode) {
+  redirectToGame(mode, code) {
     if (typeof window === "undefined") return;
     const { roomCode, name } = get();
-    if (!roomCode) return; // defensive: nothing to hand off
     const trimmed = name.trim();
-    window.location.href = buildGameUrl(roomCode, trimmed, mode);
+    // For 'create' there's no roomCode yet — apps/game creates the room
+    // and the server returns the authoritative code which the WaitingRoom
+    // surfaces. For 'join' the caller passes the code from the form input.
+    const finalCode = mode === "join" ? (code ?? roomCode) : null;
+    window.location.href = buildGameUrl(finalCode, trimmed, mode);
   },
 }));
