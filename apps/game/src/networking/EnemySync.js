@@ -108,6 +108,38 @@ export class EnemySync {
 
     // Dragon fireballs: spawn / despawn / reflect a purely visual projectile.
     on("dragonFireball", (p) => this._onDragonFireball(p));
+
+    // ── Initial backfill ────────────────────────────────────────────────
+    // EnemySync is created when the Game scene mounts, but the bridge has
+    // already joined the room — Colyseus has fired state.enemies.onAdd for
+    // every pre-existing entry, and the bridge has already re-emitted those
+    // as "enemySpawn" events that we missed. Walk the current room state
+    // once and upsert every entry we find so the visuals catch up.
+    try {
+      const state = typeof this._bridge.getRoomState === "function"
+        ? this._bridge.getRoomState()
+        : null;
+      if (state) {
+        state.enemies?.forEach?.((enemy, id) => {
+          this._onEnemyUpsert({ id, enemy });
+        });
+        state.dragons?.forEach?.((dragon, id) => {
+          this._onEnemyUpsert({
+            id,
+            enemy: dragon,
+            kind: "dragon",
+            x: dragon.x,
+            y: dragon.y,
+            z: dragon.z,
+            rotationY: dragon.rotationY,
+            health: dragon.health,
+            maxHealth: dragon.maxHealth,
+          });
+        });
+      }
+    } catch (err) {
+      if (this._debug) console.warn("[EnemySync] initial backfill failed", err);
+    }
   }
 
   disable() {
