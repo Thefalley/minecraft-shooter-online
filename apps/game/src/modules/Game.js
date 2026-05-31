@@ -16,6 +16,7 @@ import { buildViewmodel, disposeViewmodel } from './Viewmodels.js';
 import { Shop } from './Shop.js';
 import { MageController } from './MageController.js';
 import { BALANCE } from './GameBalance.js';
+import { WorldSync } from '../networking/WorldSync.js';
 
 export class Game {
   constructor(root, options = {}) {
@@ -54,6 +55,27 @@ export class Game {
       moveSpeed: BALANCE.player.moveSpeed * (this.character.speedMult ?? 1),
     });
     this.player.setPosition(...this.world.getSpawnPoint().toArray());
+
+    // Multiplayer: bind the local world to the server's authoritative one.
+    // Server's WorldSeed event will trigger a regenerate so every peer
+    // starts from the same procedural base, then mining/placement go through
+    // the network. Singleplayer skips this entirely — no-op when no network.
+    if (this.network && typeof this.network.getBridge === 'function') {
+      const bridge = this.network.getBridge();
+      if (bridge) {
+        this._worldSync = new WorldSync(this.world, bridge, {
+          onWorldRebuilt: () => {
+            // World geometry changed under the player — snap them to the
+            // fresh spawn point so they don't end up inside terrain or
+            // floating above it.
+            if (this.player && typeof this.player.setPosition === 'function') {
+              this.player.setPosition(...this.world.getSpawnPoint().toArray());
+            }
+          },
+        });
+        this._worldSync.enable();
+      }
+    }
     this.weapons = new Weapons({
       camera: this.camera,
       scene: this.scene,
@@ -1226,6 +1248,8 @@ export class Game {
 
   dispose() {
     this.renderer.setAnimationLoop(null);
+    this._worldSync?.disable?.();
+    this._worldSync = null;
     this.input.dispose?.();
     this.hud.destroy?.();
     this.shop?.hide?.();

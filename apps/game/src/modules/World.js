@@ -141,6 +141,24 @@ export class World extends THREE.Group {
     this.generate();
   }
 
+  // Rebuild the world from an authoritative seed + dimensions. Used by the
+  // multiplayer WorldSync handshake: the server publishes its seed on join
+  // and the client must regenerate the procedural base identically before
+  // replaying the cumulative delta list. Pure additive — singleplayer never
+  // calls this.
+  regenerateFromSeed({ seed, width, depth, maxHeight, waterLevel } = {}) {
+    if (Number.isFinite(seed)) this.options.seed = seed;
+    if (Number.isFinite(width)) this.options.width = width;
+    if (Number.isFinite(depth)) this.options.depth = depth;
+    if (Number.isFinite(maxHeight)) this.options.maxHeight = maxHeight;
+    if (Number.isFinite(waterLevel)) this.options.waterLevel = waterLevel;
+
+    // generate() already clears meshes + blocks + instance indices before
+    // running the procedural pass, so we can just delegate.
+    this.flatTop = null;
+    this.generate();
+  }
+
   generate() {
     this.clearMeshes();
     this.blocks.clear();
