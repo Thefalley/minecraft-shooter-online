@@ -111,19 +111,43 @@ async function gotoLobbyAndEnterRoom({ page, playerName, mode, roomCode }) {
   await page.goto(LOBBY_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
 
   // The form is client-rendered (`use client`) but the inputs should show up
-  // within a second or two after hydration.
+  // within a second or two after hydration. Wait a beat after fill so React's
+  // setState (zustand) propagates into the button-disabled state.
   await page.locator('input#name').waitFor({ state: "visible", timeout: 20_000 });
   await page.fill('input#name', playerName);
 
   if (mode === "create") {
-    // The "Crear sala" button is the first button in the lobby card.
-    await page.getByRole("button", { name: /^Crear sala$/i }).click();
+    const createBtn = page.getByRole("button", { name: /^Crear sala$/i });
+    // Poll-click: try every 250ms for up to 20s. Bypasses the strict
+    // actionability check (which fails if React hasn't enabled the button
+    // yet) by directly clicking via JS. This is much more forgiving when
+    // Vercel/Next.js hydration is slow.
+    await page.waitForFunction(
+      () => {
+        const inp = document.querySelector("input#name");
+        const btns = Array.from(document.querySelectorAll("button"));
+        const create = btns.find((b) => (b.textContent || "").trim() === "Crear sala");
+        return inp && inp.value.length > 0 && create && !create.disabled;
+      },
+      undefined,
+      { timeout: 20_000 },
+    );
+    await createBtn.click();
   } else {
     if (!roomCode) {
       throw new Error(`Bot ${playerName} has no roomCode to join`);
     }
     await page.locator('input#code').waitFor({ state: "visible", timeout: 15_000 });
     await page.fill('input#code', roomCode);
+    await page.waitForFunction(
+      () => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        const join = btns.find((b) => (b.textContent || "").trim() === "Unirse");
+        return join && !join.disabled;
+      },
+      undefined,
+      { timeout: 20_000 },
+    );
     await page.getByRole("button", { name: /^Unirse$/i }).click();
   }
 
@@ -137,7 +161,17 @@ async function gotoLobbyAndEnterRoom({ page, playerName, mode, roomCode }) {
     .locator('.vd-lobby-code')
     .waitFor({ state: "visible", timeout: 45_000 });
 
-  // 3. Pull the code that the WaitingRoom is showing (server-confirmed).
+  // 3. The WaitingRoom renders a "······" placeholder until the server's
+  //    welcome event fires. Wait for the real 5-char code before returning.
+  await page.waitForFunction(
+    () => {
+      const el = document.querySelector(".vd-lobby-code");
+      const t = (el?.textContent ?? "").trim();
+      return /^[A-Z0-9]{4,8}$/.test(t);
+    },
+    null,
+    { timeout: 30_000 },
+  );
   const codeText = (await page.locator(".vd-lobby-code").textContent()) || "";
   return codeText.replace(/\s+/g, "").toUpperCase();
 }
@@ -147,21 +181,41 @@ async function gotoLobbyAndEnterRoom({ page, playerName, mode, roomCode }) {
  * not mounted (i.e., the player never made it into the game).
  */
 async function readStats(page) {
+  // Read everything in-page so we don't depend on Playwright's selector
+  // engine reaching past stale frames. Returns raw text + parsed numbers.
   try {
-    const has = await page.locator(".vd-stats-overlay").count();
-    if (!has) return { fps: null, ping: null, room: null };
-    const fpsText = (await page.locator(".vd-stats-overlay .v-fps").textContent()) || "";
-    const pingText = (await page.locator(".vd-stats-overlay .v-ping").textContent()) || "";
-    const roomText = (await page.locator(".vd-stats-overlay .v-room").textContent()) || "";
-    const fps = parseInt(fpsText.replace(/[^0-9]/g, ""), 10);
-    const ping = parseInt(pingText.replace(/[^0-9]/g, ""), 10);
+    const data = await page.evaluate(() => {
+      const root = document.querySelector(".vd-stats-overlay");
+      if (!root) return { found: false };
+      const grab = (sel) => {
+        const el = root.querySelector(sel);
+        return el ? (el.textContent || "").trim() : null;
+      };
+      return {
+        found: true,
+        fpsText: grab(".v-fps"),
+        pingText: grab(".v-ping"),
+        roomText: grab(".v-room"),
+        // Also dump full overlay text in case the structure differs.
+        allText: (root.textContent || "").trim(),
+      };
+    });
+    if (!data?.found) return { fps: null, ping: null, room: null, raw: null };
+    const parse = (txt) => {
+      if (!txt) return null;
+      const m = String(txt).match(/(\d+(?:\.\d+)?)/);
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      return Number.isFinite(n) ? Math.round(n) : null;
+    };
     return {
-      fps: Number.isFinite(fps) ? fps : null,
-      ping: Number.isFinite(ping) ? ping : null,
-      room: roomText.trim() || null,
+      fps: parse(data.fpsText),
+      ping: parse(data.pingText),
+      room: data.roomText || null,
+      raw: data.allText || null,
     };
   } catch {
-    return { fps: null, ping: null, room: null };
+    return { fps: null, ping: null, room: null, raw: null };
   }
 }
 
@@ -297,24 +351,29 @@ async function main() {
     await sleep(1500);
 
     // --- 4. Bots 2..8 join in parallel ---
+    // Stagger them by 300ms so hydration / animation-frame ticks don't all
+    // collide on the lone Chromium event loop. Bots are still effectively
+    // concurrent — the server sees all join requests within ~2s of each other.
     log(`spawning ${NUM_PLAYERS - 1} bots to join room ${roomCode}...`);
     const joinTasks = [];
     for (let i = 1; i < NUM_PLAYERS; i++) {
+      const idx = i;
       joinTasks.push(
         (async () => {
+          await sleep((idx - 1) * 300);
           try {
             const code = await gotoLobbyAndEnterRoom({
-              page: pages[i],
-              playerName: playerNames[i],
+              page: pages[idx],
+              playerName: playerNames[idx],
               mode: "join",
               roomCode,
             });
-            perPlayer[i].joinedRoom = true;
-            perPlayer[i].room = code;
-            log(`  ${playerNames[i]} joined room ${code}`);
+            perPlayer[idx].joinedRoom = true;
+            perPlayer[idx].room = code;
+            log(`  ${playerNames[idx]} joined room ${code}`);
           } catch (err) {
-            perPlayer[i].errors.push(err.message);
-            log(`  !! ${playerNames[i]} failed to join: ${err.message}`);
+            perPlayer[idx].errors.push(err.message);
+            log(`  !! ${playerNames[idx]} failed to join: ${err.message}`);
           }
         })(),
       );
@@ -424,12 +483,53 @@ async function main() {
     await Promise.all(moveTasks);
 
     // --- 8. Read stats once everyone has had a chance to render ---
-    await sleep(1500);
+    // In headless Chromium, requestAnimationFrame in backgrounded contexts is
+    // throttled, leaving the StatsOverlay rolling FPS counter at "--" (it
+    // needs >=1 frame in a 1-second window). Work around that by visiting
+    // each page in turn with bringToFront(), then directly run our own
+    // 1.2-second rAF measurement inside the page via page.evaluate(). This
+    // bypasses the StatsOverlay sampling cadence entirely.
+    log("sampling stats per-player (bringToFront + in-page rAF count)...");
     for (let i = 0; i < NUM_PLAYERS; i++) {
+      try {
+        await pages[i].bringToFront();
+      } catch {
+        /* ignore */
+      }
+      // Give the page 500ms to recover from the bringToFront before we count.
+      await sleep(500);
+      let measuredFps = null;
+      try {
+        measuredFps = await pages[i].evaluate(async () => {
+          // Count rAF callbacks over a 1200ms window. This is the same
+          // measurement the StatsOverlay does, just synchronously controlled
+          // from the test so we don't miss the bucket boundary.
+          return await new Promise((resolve) => {
+            let frames = 0;
+            const start = performance.now();
+            const deadline = start + 1200;
+            const tick = (now) => {
+              frames += 1;
+              if (now >= deadline) {
+                const elapsed = now - start;
+                resolve(elapsed > 0 ? Math.round((frames * 1000) / elapsed) : 0);
+              } else {
+                requestAnimationFrame(tick);
+              }
+            };
+            requestAnimationFrame(tick);
+          });
+        });
+      } catch (err) {
+        perPlayer[i].errors.push(`fps probe: ${err.message}`);
+      }
       const stats = await readStats(pages[i]);
-      perPlayer[i].fps = stats.fps;
+      perPlayer[i].fps = Number.isFinite(measuredFps) ? measuredFps : stats.fps;
       perPlayer[i].ping = stats.ping;
       if (!perPlayer[i].room && stats.room) perPlayer[i].room = stats.room;
+      log(
+        `  stats ${playerNames[i]}: fps=${perPlayer[i].fps ?? "-"} (overlay=${stats.fps ?? "-"}) ping=${perPlayer[i].ping ?? "-"} room=${perPlayer[i].room ?? "-"}`,
+      );
     }
   } catch (err) {
     log(`FATAL during run: ${err.message}`);

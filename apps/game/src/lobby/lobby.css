@@ -375,6 +375,11 @@
   transition: opacity 200ms ease-out;
 }
 .vd-pointer-hint.is-hidden { opacity: 0; }
+/* pointer-events does NOT inherit — every descendant defaults to auto. Without
+ * this rule the inner .hint div catches the click meant for the canvas (when
+ * the user clicks ON the text/icon), the canvas never sees the click, and
+ * requestPointerLock never fires. Cascade through the whole subtree. */
+.vd-pointer-hint * { pointer-events: none; }
 .vd-pointer-hint .hint {
   background: rgba(0, 0, 0, 0.72);
   border: 1px solid rgba(255, 255, 255, 0.16);
