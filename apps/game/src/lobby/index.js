@@ -11,3 +11,4 @@
 export { WaitingRoom } from "./WaitingRoom.js";
 export { CharacterSelectStrip } from "./CharacterSelectStrip.js";
 export { StatsOverlay } from "./StatsOverlay.js";
+export { PointerLockHint } from "./PointerLockHint.js";

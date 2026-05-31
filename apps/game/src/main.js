@@ -7,7 +7,7 @@ import {
   readJoinParams,
   clearJoinParams,
 } from './networking/index.js';
-import { WaitingRoom, StatsOverlay } from './lobby/index.js';
+import { WaitingRoom, StatsOverlay, PointerLockHint } from './lobby/index.js';
 
 const root = document.querySelector('#app');
 
@@ -39,10 +39,12 @@ async function startMultiplayer({ name, code, characterId, mode }) {
   let coordinator = null;
   let waitingRoom = null;
   let stats = null;
+  let pointerHint = null;
 
   const teardown = async () => {
     try { waitingRoom?.dispose(); } catch { /* ignore */ }
     try { stats?.unmount(); } catch { /* ignore */ }
+    try { pointerHint?.unmount(); } catch { /* ignore */ }
     try { await coordinator?.stop(); } catch { /* ignore */ }
     clearJoinParams();
   };
@@ -107,6 +109,11 @@ async function startMultiplayer({ name, code, characterId, mode }) {
         });
         coordinator.bind(game);
         game.start();
+        // Mount the pointer-lock hint AFTER game.start() so it sits on top
+        // of the freshly-mounted canvas. Hides itself as soon as the player
+        // clicks and pointer lock engages.
+        pointerHint = new PointerLockHint();
+        pointerHint.mount();
       },
       onLeave: async () => {
         await teardown();
