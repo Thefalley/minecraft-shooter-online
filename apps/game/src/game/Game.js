@@ -1157,6 +1157,22 @@ export class Game {
         window.__voxelDebug.push('mp:input:error', { err: String(err) });
       }
     }
+    // Trace: when any directional key flips, drop a single ring entry so we
+    // can verify the pump actually fires under real play (the diagnostic
+    // harness reads __voxelDebug.ring). This is gated on a transition so
+    // we don't blow up the buffer.
+    if (typeof window !== 'undefined' && window.__voxelDebug) {
+      const sig = `${cmd.forward}|${cmd.backward}|${cmd.left}|${cmd.right}|${cmd.jump}|${cmd.sprint}`;
+      if (sig !== this._lastPumpSig) {
+        this._lastPumpSig = sig;
+        window.__voxelDebug.push('mp:input:cmd', {
+          forward: cmd.forward, backward: cmd.backward, left: cmd.left,
+          right: cmd.right, jump: cmd.jump, sprint: cmd.sprint,
+          rotationY: +cmd.rotationY.toFixed(2),
+          seq: cmd.seq,
+        });
+      }
+    }
   }
 
   clampPlayerToBounds() {
