@@ -30,6 +30,7 @@ import {
   WORLD_WIDTH,
 } from "@mvp/shared";
 import { debugLog, clearDebugLog } from "../debugLog.js";
+import { updateMetrics, clearMetrics } from "../metrics.js";
 import { FireballState } from "../schema/FireballState.js";
 import { GameState } from "../schema/GameState.js";
 import { VoxelPlayer } from "../schema/VoxelPlayer.js";
@@ -389,13 +390,26 @@ export class GameRoom extends Room<GameState> {
     player.id = client.sessionId;
     player.name = name;
 
-    // Spawn on a circle around origin so concurrent joiners don't overlap.
+    // Spawn south of the meadow castle. The current MP map (meadow) has a
+    // stone castle at (0,0) with castleHalf=8 and a south gate at z=+8;
+    // spawning at (0,0) traps every player inside the walls and the AI
+    // chases them but they can't see anything. The CLIENT picks z=18 in
+    // its onWorldRebuilt hook — the server must agree on the SAME spot or
+    // the AI targets the server's ghost position while the player's
+    // visual is 18 blocks south.
+    //
+    // Each concurrent joiner is offset on a small arc so they don't
+    // overlap, but still inside the safe south corridor.
+    const SPAWN_BASE_X = 0;
+    const SPAWN_BASE_Z = 18;
     const angle = (this.spawnAngle += Math.PI / 4);
-    const radius = 3;
-    player.x = Math.cos(angle) * radius;
-    player.z = Math.sin(angle) * radius;
+    const radius = 1.5;
+    player.x = SPAWN_BASE_X + Math.cos(angle) * radius;
+    player.z = SPAWN_BASE_Z + Math.sin(angle) * radius;
     player.y = PLAYER_SPAWN_Y;
-    player.rotationY = angle + Math.PI;
+    // Face north so the player can see the castle (and the wave-1 enemies
+    // that spawn in a ring around the origin).
+    player.rotationY = 0;
     player.health = PLAYER_DEFAULT_HEALTH;
     player.maxHealth = PLAYER_DEFAULT_HEALTH;
     player.alive = true;
@@ -499,6 +513,7 @@ export class GameRoom extends Room<GameState> {
   onDispose(): void {
     console.log(`[GameRoom ${this.state.roomCode}] disposed`);
     clearDebugLog(this.state.roomCode);
+    clearMetrics(this.state.roomCode);
   }
 
   // -------------------------------------------------------------------------
@@ -688,18 +703,6 @@ export class GameRoom extends Room<GameState> {
     const ndy = direction[1] / dirLen;
     const ndz = direction[2] / dirLen;
 
-    // ── Broadcast the fired event to ALL clients so remote players can
-    // render the tracer / muzzle flash for this shot. Done after origin /
-    // direction validation but before lag-comp / raycast so a long hit
-    // resolution never delays the visual. Shooter dedupes by sessionId.
-    this.broadcast(VoxelServerMessage.WeaponFired, {
-      shooterSessionId: client.sessionId,
-      slotIndex,
-      origin: [origin[0], origin[1], origin[2]],
-      direction: [ndx, ndy, ndz],
-      slot: weapon.id,
-    });
-
     // Reject shots whose origin is wildly far from the shooter's authoritative
     // position. This is a cheap cheat-guard, not a precise eye-position check.
     const oDx = origin[0] - shooter.x;
@@ -709,6 +712,18 @@ export class GameRoom extends Room<GameState> {
       client.send(VoxelServerMessage.WeaponMiss, { seq, shotId });
       return;
     }
+
+    // ── Broadcast the fired event to ALL clients so remote players can
+    // render the tracer / muzzle flash for this shot. Done after input /
+    // origin validation but before lag-comp / raycast so a long hit
+    // resolution never delays the visual. Shooter dedupes by sessionId.
+    this.broadcast(VoxelServerMessage.WeaponFired, {
+      shooterSessionId: client.sessionId,
+      slotIndex,
+      origin: [origin[0], origin[1], origin[2]],
+      direction: [ndx, ndy, ndz],
+      slot: weapon.id,
+    });
 
     // ── clientTime freshness ───────────────────────────────────────────────
     const clientTime =
@@ -1018,6 +1033,17 @@ export class GameRoom extends Room<GameState> {
   // -------------------------------------------------------------------------
 
   private update(): void {
+    // ── Performance timing (rolling 60-sample window) ──
+    // We capture three measurements:
+    //   tickDurationMs   total wall-clock of this update() call
+    //   aiCostMs         tickEnemies + tickDragons + tickFireballs (+ boss)
+    //   broadcastCostMs  everything else (mostly state mutation / wave logic)
+    // process.hrtime.bigint() gives ns precision; the math stays in ms for
+    // human-readable HTTP output. The hot path stays allocation-free —
+    // metrics.ts uses pre-sized Float64Array rings under the hood.
+    const tickStart = process.hrtime.bigint();
+    let aiCostNs = 0n;
+
     this.state.tick = (this.state.tick + 1) >>> 0;
     const dt = TICK_INTERVAL_MS / 1000;
 
@@ -1047,11 +1073,13 @@ export class GameRoom extends Room<GameState> {
       // Refresh the player views cache once per tick — AI ticks read it many
       // times (once per enemy/dragon) but the player set rarely changes.
       this.refreshPlayerViewsCache();
+      const aiStart = process.hrtime.bigint();
       this.tickEnemies(dt);
       this.tickDragons(dt);
       this.tickFireballs(dt);
       this.tickBossProjectiles(dt);
       this.tickBossFireZones(dt);
+      aiCostNs = process.hrtime.bigint() - aiStart;
       // Mid-cinematic? When the timer expires, transition out and either spawn
       // the next wave or end the run. While in flight, we still tick the
       // boss-projectile cleanup above (in case wave 5 spilled into wave 10).
@@ -1065,6 +1093,30 @@ export class GameRoom extends Room<GameState> {
     // HISTORY_SAMPLE_INTERVAL_MS. Done last so the snapshot reflects the
     // post-tick authoritative state.
     this.maybeSampleHistory();
+
+    // ── Push the freshly-measured costs into the metrics ring ──
+    const tickDurationNs = process.hrtime.bigint() - tickStart;
+    const tickDurationMs = Number(tickDurationNs) / 1e6;
+    const aiCostMs = Number(aiCostNs) / 1e6;
+    // "broadcast / state mutation" cost = everything not in the AI block.
+    // tickPlayers + maybeSampleHistory + wave logic + the (intrinsic) Colyseus
+    // patch encoding that runs synchronously inside our update slot.
+    const broadcastCostMs = Math.max(0, tickDurationMs - aiCostMs);
+    if (this.state.roomCode) {
+      updateMetrics(this.state.roomCode, {
+        tickDurationMs,
+        aiCostMs,
+        broadcastCostMs,
+        enemyCount: this.state.enemies.size,
+        dragonCount: this.state.dragons.size,
+        fireballCount: this.state.fireballs.size,
+        bossProjectileCount: this.bossProjectiles.length,
+        playerCount: this.state.players.size,
+        deltaCount: this.state.world.deltas.size,
+        wave: this.state.wave,
+        phase: this.state.phase,
+      });
+    }
   }
 
   /**
