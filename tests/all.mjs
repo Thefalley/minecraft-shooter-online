@@ -42,6 +42,7 @@ const suites = [
   { key: 'behavior', name: 'Feature behavior (chase, drift, late join, world sync)', file: 'behavior-multiplayer.mjs' },
   { key: 'sync', name: 'Sync-rate (server vs client tick, inter-client drift)', file: 'sync-rate.mjs' },
   { key: 'logs', name: 'Log equivalence (server ring ≡ client ring)', file: 'log-equivalence.mjs' },
+  { key: 'perf', name: 'Performance metrics (server tick rate)', file: 'perf-metrics.mjs' },
   { key: 'multikill', name: 'Multi-client kill (3 browsers, all log + cinematic)', file: 'multi-client-kill.mjs' },
   { key: 'ui', name: 'UI + game physics (Playwright)', file: 'ui-game-physics.mjs' },
 ];

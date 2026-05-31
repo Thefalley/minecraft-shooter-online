@@ -48,6 +48,15 @@ export class ColyseusClient {
     return this._client;
   }
 
+  /**
+   * HTTP base for the same host as the websocket. Used by NetworkMetrics
+   * (apps/game/src/dev) to poll /debug/rooms/<code>/stats so the dump()
+   * surface can show server-side tick rate alongside client FPS.
+   */
+  get httpBase() {
+    return this._httpBase;
+  }
+
   /** Most recently opened Room, or null. */
   get room() {
     return this._room;

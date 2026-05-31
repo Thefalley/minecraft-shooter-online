@@ -72,6 +72,10 @@ jobs:
         timeout-minutes: 3
         run: node tests/log-equivalence.mjs
 
+      - name: Self-check — performance metrics (server tick rate)
+        timeout-minutes: 3
+        run: node tests/perf-metrics.mjs
+
       - name: Self-check — multi-client kill (3 browsers, all log + cinematic)
         timeout-minutes: 5
         run: node tests/multi-client-kill.mjs

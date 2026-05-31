@@ -121,6 +121,16 @@ export class NetworkBridge {
     return this._status;
   }
 
+  /**
+   * HTTP base URL of the Colyseus host. Lets NetworkMetrics fetch the
+   * server's /debug/rooms/<code>/stats endpoint over plain HTTP without
+   * needing the build-time VITE_SERVER_URL again. Returns null if the
+   * underlying client hasn't been configured yet.
+   */
+  getHttpBase() {
+    return this._client?.httpBase ?? null;
+  }
+
   /** Snap-of-truth state for the local renderer. May be null before connect. */
   getRoomState() {
     return this._room ? this._room.state : null;

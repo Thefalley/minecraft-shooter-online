@@ -5,8 +5,11 @@ import cors from "cors";
 import express from "express";
 import http from "node:http";
 import { getDebugLog } from "./debugLog.js";
+import { getMetrics, listMetrics } from "./metrics.js";
 import { GameRoom } from "./rooms/GameRoom.js";
 import { isValidRoomCode, normalizeRoomCode } from "./utils/roomCode.js";
+
+const PROCESS_STARTED_AT = Date.now();
 
 const PORT = Number(process.env.PORT ?? SERVER_DEFAULT_PORT);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "*";
@@ -74,6 +77,46 @@ app.get("/debug/rooms/:code", async (req, res) => {
     console.error("[/debug/rooms]", err);
     res.status(500).json({ error: "INTERNAL_ERROR" });
   }
+});
+
+// Debug endpoint: per-room performance metrics. Mirrors the per-tick struct
+// the room captures into apps/server/src/metrics.ts. The client samples this
+// every 5 s (see apps/game/src/dev/NetworkMetrics.js) so an external agent
+// can call `__voxelDebug.dump()` and see both sides at once.
+app.get("/debug/rooms/:code/stats", (req, res) => {
+  const raw = req.params.code ?? "";
+  if (!isValidRoomCode(raw)) {
+    res.status(400).json({ error: "INVALID_CODE" });
+    return;
+  }
+  const code = normalizeRoomCode(raw);
+  const metrics = getMetrics(code);
+  if (!metrics) {
+    res.status(404).json({ error: "ROOM_NOT_FOUND" });
+    return;
+  }
+  res.json({ roomCode: code, ...metrics });
+});
+
+// Debug endpoint: process-wide stats. Aggregates room counters and reports the
+// resident-set memory + process uptime. Cheap to call; intended for a single
+// dashboard tick (not per-frame).
+app.get("/debug/global/stats", (_req, res) => {
+  const rooms = listMetrics();
+  let totalPlayers = 0;
+  let totalEnemies = 0;
+  for (const r of rooms) {
+    totalPlayers += r.metrics.playerCount;
+    totalEnemies += r.metrics.enemyCount + r.metrics.dragonCount;
+  }
+  const mem = process.memoryUsage();
+  res.json({
+    uptimeS: +((Date.now() - PROCESS_STARTED_AT) / 1000).toFixed(1),
+    totalRooms: rooms.length,
+    totalPlayers,
+    totalEnemies,
+    memoryUsedMB: +(mem.rss / (1024 * 1024)).toFixed(1),
+  });
 });
 
 // Lookup endpoint: does a room with this code exist? Returns its roomId so the client can joinById.
