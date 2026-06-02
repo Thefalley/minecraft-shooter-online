@@ -1,36 +1,27 @@
 /**
  * Multi-player position trace.
  *
- * Spawns N (default 2) real browser clients in the same room. One of them
- * moves through a predetermined sequence (idle → forward slow → forward
- * sprint → strafe → spin) while the trace samples every 100 ms:
- *   - client cameraHolder.position (what the user sees)
- *   - server state.players[selfId].x/y/z (what the AI targets)
- *   - server state.enemies (each zombie's xyz)
- *   - corresponding client mesh position per zombie
- *   - input cmd flips logged into __voxelDebug.ring
+ * Strategy: a raw Colyseus host (no browser) creates the room and starts
+ * the game; N browser clients join the running room via the direct game
+ * URL. This sidesteps the brittle React lobby form for Playwright.
  *
- * Output: trace.txt — one row per sample, columns:
- *   t_ms  who  what            x        y        z        extra
- * Easy to grep ('grep ^P1 trace.txt' → only player1 rows, etc).
+ * Each browser is driven through a movement script (idle/forward/sprint/
+ * strafe). We sample every 100 ms:
+ *   - cameraHolder.position (visual)
+ *   - state.players[self].x/y/z (server's view of THIS browser)
+ *   - state.enemies (each id) + matching client mesh per id
  *
- * Plus trace.json — the raw structured dump for programmatic analysis.
+ * Output:
+ *   traces/position-trace.txt   one row per sample, grep-able
+ *   traces/position-trace.json  raw structured dump
  *
- * Designed to surface:
- *   - drift between client and server position of the SAME player
- *   - whether the drift grows with movement speed (overflow theory)
- *   - whether the zombie AI is targeting the server pos or some stale value
- *   - whether the input pump is firing at the expected 20 Hz
- *
- * Usage:
- *   node tests/position-trace.mjs                   # 2 clients, 30 s
- *   node tests/position-trace.mjs --clients=3 --secs=45
- *   node tests/position-trace.mjs --out=mytrace.txt
+ * Usage: node tests/position-trace.mjs --clients=2 --secs=20
  */
 
 import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
+import { createClient, createRoom, waitForState, safeLeave } from './lib/colyseus.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -38,17 +29,19 @@ const args = Object.fromEntries(
     return [k, v ?? true];
   })
 );
-const LOBBY = args.lobby || 'https://minecraft-shooter-online-web.vercel.app';
+const SERVER = args.server || 'wss://minecraft-shooter-online.onrender.com';
+const GAME = args.game || 'https://voxel-dragons-game.vercel.app';
 const N = Number(args.clients) || 2;
-const SECS = Number(args.secs) || 30;
+const SECS = Number(args.secs) || 20;
 const OUT_TXT = resolve(args.out || 'traces/position-trace.txt');
 const OUT_JSON = OUT_TXT.replace(/\.txt$/, '.json');
-
 await mkdir(dirname(OUT_TXT), { recursive: true });
 
-console.log(`Spawning ${N} browsers, sampling for ${SECS}s, output → ${OUT_TXT}`);
+console.log(`Raw-Colyseus host + ${N} browsers, sampling for ${SECS}s → ${OUT_TXT}`);
 
-const browser = await chromium.launch({ headless: true });
+let hostClient = null;
+let hostRoom = null;
+let browser = null;
 const pages = [];
 
 async function dump(page) {
@@ -74,16 +67,16 @@ async function dump(page) {
     }
     if (state?.enemies && g.zombies?._serverEntities) {
       const allLocal = new Map();
-      for (const z of g.zombies._serverEntities.values()) allLocal.set(z.id, { mgr: 'zombie', mesh: z.mesh });
-      for (const s of (g.skeletons?._serverEntities?.values() ?? [])) allLocal.set(s.id, { mgr: 'skel', mesh: s.mesh });
-      for (const w of (g.witches?._serverEntities?.values() ?? [])) allLocal.set(w.id, { mgr: 'witch', mesh: w.mesh });
+      for (const z of g.zombies._serverEntities.values()) allLocal.set(z.id, z.mesh);
+      for (const s of (g.skeletons?._serverEntities?.values() ?? [])) allLocal.set(s.id, s.mesh);
+      for (const w of (g.witches?._serverEntities?.values() ?? [])) allLocal.set(w.id, w.mesh);
       state.enemies.forEach((e, id) => {
-        const local = allLocal.get(id);
+        const mesh = allLocal.get(id);
         out.enemies.push({
           id,
           kind: e.kind,
           server: { x: e.x, y: e.y, z: e.z },
-          client: local?.mesh ? { x: local.mesh.position.x, y: local.mesh.position.y, z: local.mesh.position.z } : null,
+          client: mesh ? { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z } : null,
         });
       });
     }
@@ -91,126 +84,81 @@ async function dump(page) {
   });
 }
 
-async function lastInputCmds(page) {
-  return await page.evaluate(() => {
-    const ring = window.__voxelDebug?.ring ?? [];
-    return ring.filter((e) => e.category === 'mp:input:cmd').slice(-10);
-  });
-}
-
 try {
-  // Host (P1) creates the room
-  let roomCode;
+  // 1) Raw Colyseus host creates room and starts the game
+  hostClient = await createClient(SERVER);
+  hostRoom = await createRoom(hostClient, { name: 'HostBot', characterId: 'duck' });
+  await waitForState(hostRoom, (s) => !!s.roomCode, { timeoutMs: 5000 });
+  const roomCode = hostRoom.state.roomCode;
+  console.log(`Room ${roomCode} ready`);
+
+  // 2) N browser clients navigate directly to the game URL with ?join params
+  browser = await chromium.launch({ headless: true });
   for (let i = 0; i < N; i += 1) {
     const ctx = await browser.newContext({ viewport: { width: 1024, height: 700 } });
     const page = await ctx.newPage();
-    if (i === 0) {
-      await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 60000 });
-      await page.fill('#name', `P${i + 1}`);
-      await page.click('button:has-text("Crear sala")');
-      await page.waitForURL(/voxel-dragons-game/, { timeout: 40000 });
-      await page.waitForFunction(() => !!document.querySelector('.vd-lobby-code'), { timeout: 30000 });
-      roomCode = await page.evaluate(
-        () => document.querySelector('.vd-lobby-code')?.textContent?.trim()
-      );
-      console.log(`P1 created room ${roomCode}`);
-    } else {
-      await page.goto(LOBBY, { waitUntil: 'networkidle', timeout: 60000 });
-      await page.fill('#name', `P${i + 1}`);
-      await page.fill('#code', roomCode);
-      // React state catches up after fill; wait until Unirse button enables.
-      await page.waitForFunction(
-        () => {
-          const btns = [...document.querySelectorAll('button')];
-          const b = btns.find((x) => /Unirse/i.test(x.textContent || ''));
-          return b && !b.disabled;
-        },
-        { timeout: 20000 }
-      ).catch(() => {});
-      await page.evaluate(() => {
-        const btns = [...document.querySelectorAll('button')];
-        const b = btns.find((x) => /Unirse/i.test(x.textContent || ''));
-        if (b) { b.disabled = false; b.click(); }
-      });
-      await page.waitForURL(/voxel-dragons-game/, { timeout: 40000 });
-      console.log(`P${i + 1} joined ${roomCode}`);
-    }
+    const url = `${GAME}/?name=P${i + 1}&mode=join&code=${roomCode}`;
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
     pages.push(page);
+    console.log(`P${i + 1} navigated to game URL`);
   }
-  // Wait for everyone in waiting room then host starts. Triggering the
-  // button via DOM directly bypasses Playwright actionability — the button
-  // may briefly appear disabled while React reconciles.
-  await new Promise((r) => setTimeout(r, 7000));
-  await pages[0].evaluate(() => {
-    const btn = document.querySelector('.vd-lobby-start');
-    if (btn) {
-      btn.disabled = false;
-      btn.click();
-    }
-  });
-  for (const page of pages) {
-    await page.waitForFunction(() => !!document.querySelector('canvas'), { timeout: 30000 });
-    await page.waitForFunction(() => !!window.__voxelGame, { timeout: 30000 });
-  }
-  console.log('All clients in scene. Waiting 4 s for EnemySync backfill.');
+  // Wait for all browsers to reach the WaitingRoom (game's networking has connected)
   await new Promise((r) => setTimeout(r, 4000));
 
-  // Engage pointer lock on P1 by clicking the canvas centre
+  // 3) Host starts the game from raw Colyseus
+  hostRoom.send('vp:lobby:start', { countdownMs: 200 });
+  await waitForState(hostRoom, (s) => s.phase === 'playing', { timeoutMs: 5000 });
+  await waitForState(hostRoom, (s) => s.enemies.size > 0, { timeoutMs: 5000 });
+  console.log('Server in playing phase, enemies spawned');
+
+  // Wait for every browser to finish countdown + mount the game scene
+  for (let i = 0; i < pages.length; i += 1) {
+    try {
+      await pages[i].waitForFunction(() => !!window.__voxelGame, { timeout: 30000 });
+      console.log(`P${i + 1} scene mounted`);
+    } catch (e) {
+      console.log(`P${i + 1} scene mount FAILED — ${e.message?.split('\n')[0]}`);
+    }
+  }
+  await new Promise((r) => setTimeout(r, 4000));
+
+  // 4) Engage pointer lock + click center for P1
   const c = await pages[0].$('canvas');
   const box = await c.boundingBox();
   await pages[0].mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   await new Promise((r) => setTimeout(r, 400));
 
   const lines = [];
-  const json = { meta: { lobby: LOBBY, clients: N, secs: SECS, roomCode }, samples: [] };
+  const json = { meta: { server: SERVER, game: GAME, clients: N, secs: SECS, roomCode }, samples: [] };
+  function fmt(n) { return n == null ? '----' : n.toFixed(2).padStart(7, ' '); }
+  lines.push(`# multi-player position trace — ${new Date().toISOString()}`);
+  lines.push(`# server=${SERVER} game=${GAME} clients=${N} secs=${SECS} room=${roomCode}`);
+  lines.push(`# columns: t_ms src   pid/eid             clientX clientY clientZ  serverX serverY serverZ  drift  note`);
 
-  // Drive P1 through the script while sampling all clients.
   const startedAt = Date.now();
-  const sampleEveryMs = 100;
   const totalMs = SECS * 1000;
 
-  function fmt(n) { return n == null ? '----' : n.toFixed(2).padStart(7, ' '); }
-
-  // Header
-  lines.push(`# multi-player position trace — ${new Date().toISOString()}`);
-  lines.push(`# lobby=${LOBBY} clients=${N} secs=${SECS} room=${roomCode}`);
-  lines.push(`# columns: t_ms  src   pid/eid                clientX clientY clientZ  serverX serverY serverZ  drift   note`);
-
-  // Movement script (driven on P1 only)
+  // Drive P1 through a movement script
   const driver = (async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    // Phase 1: idle 2 s
-    await sleep(2000);
+    await sleep(1500);
     lines.push(`# phase 1 idle done @ ${Date.now() - startedAt}ms`);
-    // Phase 2: forward slow 3 s
     await pages[0].keyboard.down('KeyW');
-    await sleep(3000);
+    await sleep(2500);
     lines.push(`# phase 2 forward-slow done @ ${Date.now() - startedAt}ms`);
-    // Phase 3: forward sprint 3 s
     await pages[0].keyboard.down('ShiftLeft');
-    await sleep(3000);
+    await sleep(2500);
     await pages[0].keyboard.up('ShiftLeft');
-    lines.push(`# phase 3 forward-sprint done @ ${Date.now() - startedAt}ms`);
-    // Phase 4: strafe right 2 s
+    lines.push(`# phase 3 sprint done @ ${Date.now() - startedAt}ms`);
     await pages[0].keyboard.up('KeyW');
     await pages[0].keyboard.down('KeyD');
-    await sleep(2000);
+    await sleep(1500);
     await pages[0].keyboard.up('KeyD');
-    lines.push(`# phase 4 strafe-right done @ ${Date.now() - startedAt}ms`);
-    // Phase 5: spin (mouse rotation) for 2 s while idle
-    for (let i = 0; i < 40; i += 1) {
-      await pages[0].mouse.move(box.x + box.width / 2 + i * 8, box.y + box.height / 2);
-      await sleep(50);
-    }
-    lines.push(`# phase 5 spin done @ ${Date.now() - startedAt}ms`);
-    // Phase 6: back to spawn — backward + sprint 4 s
+    lines.push(`# phase 4 strafe done @ ${Date.now() - startedAt}ms`);
     await pages[0].keyboard.down('KeyS');
-    await pages[0].keyboard.down('ShiftLeft');
-    await sleep(4000);
-    await pages[0].keyboard.up('ShiftLeft');
+    await sleep(2500);
     await pages[0].keyboard.up('KeyS');
-    lines.push(`# phase 6 back-to-spawn done @ ${Date.now() - startedAt}ms`);
-    // Phase 7: idle remainder
+    lines.push(`# phase 5 back done @ ${Date.now() - startedAt}ms`);
     while (Date.now() - startedAt < totalMs) await sleep(200);
   })();
 
@@ -222,16 +170,12 @@ try {
       catch { snaps.push(null); }
     }
     json.samples.push({ t, snaps });
-    // Plain-text row per player + per enemy as seen by P1.
     for (let i = 0; i < snaps.length; i += 1) {
       const s = snaps[i];
       if (!s) continue;
       const pid = `P${i + 1}`;
       const sp = s.serverPlayers[s.selfId];
-      const dx = sp ? (s.clientPos.x - sp.x) : null;
-      const dy = sp ? (s.clientPos.y - sp.y) : null;
-      const dz = sp ? (s.clientPos.z - sp.z) : null;
-      const drift = sp ? Math.hypot(dx, dz) : null;
+      const drift = sp ? Math.hypot(s.clientPos.x - sp.x, s.clientPos.z - sp.z) : null;
       lines.push(
         `${String(t).padStart(6, ' ')} ${pid.padEnd(5, ' ')} ${(pid + '/' + (s.selfId || '?')).slice(0, 18).padEnd(18, ' ')} ` +
         `${fmt(s.clientPos.x)} ${fmt(s.clientPos.y)} ${fmt(s.clientPos.z)}  ` +
@@ -240,12 +184,9 @@ try {
         `yaw=${s.cameraYaw?.toFixed(2) ?? '----'} pl=${s.pointerLocked ? 'Y' : 'n'}`
       );
     }
-    // Enemy rows from P1's view only (the AI position is server-side anyway)
     if (snaps[0]?.enemies) {
-      for (const e of snaps[0].enemies) {
-        const dx = e.client ? e.client.x - e.server.x : null;
-        const dz = e.client ? e.client.z - e.server.z : null;
-        const drift = dx != null ? Math.hypot(dx, dz) : null;
+      for (const e of snaps[0].enemies.slice(0, 4)) {
+        const drift = e.client ? Math.hypot(e.client.x - e.server.x, e.client.z - e.server.z) : null;
         lines.push(
           `${String(t).padStart(6, ' ')} E     ${(e.kind + ':' + e.id).padEnd(18, ' ')} ` +
           `${fmt(e.client?.x)} ${fmt(e.client?.y)} ${fmt(e.client?.z)}  ` +
@@ -254,36 +195,28 @@ try {
         );
       }
     }
-    await new Promise((r) => setTimeout(r, sampleEveryMs));
+    await new Promise((r) => setTimeout(r, 100));
   }
-
   await driver;
-
-  // Append the input-cmd ring tail from each client so we see what was pumped.
-  for (let i = 0; i < pages.length; i += 1) {
-    const cmds = await lastInputCmds(pages[i]);
-    lines.push(`# last 10 mp:input:cmd entries for P${i + 1}`);
-    for (const c of cmds) {
-      lines.push(`#   t=${c.t}  seq=${c.payload.seq}  fwd=${c.payload.forward} back=${c.payload.backward} L=${c.payload.left} R=${c.payload.right} jump=${c.payload.jump} sprint=${c.payload.sprint} yaw=${c.payload.rotationY}`);
-    }
-  }
 
   await writeFile(OUT_TXT, lines.join('\n') + '\n', 'utf8');
   await writeFile(OUT_JSON, JSON.stringify(json, null, 2), 'utf8');
-  console.log(`Wrote ${lines.length} text rows → ${OUT_TXT}`);
-  console.log(`Wrote ${json.samples.length} sample dumps → ${OUT_JSON}`);
+  console.log(`Wrote ${lines.length} rows → ${OUT_TXT}`);
+  console.log(`Wrote ${json.samples.length} samples → ${OUT_JSON}`);
 
-  // Quick spoiler: report max drift over the whole run for the moving player.
-  let maxSelfDrift = 0;
+  // Summary: max drift across all browsers across the entire run
+  let maxDrift = 0;
   for (const sample of json.samples) {
-    const s = sample.snaps[0];
-    if (!s) continue;
-    const sp = s.serverPlayers[s.selfId];
-    if (!sp) continue;
-    const d = Math.hypot(s.clientPos.x - sp.x, s.clientPos.z - sp.z);
-    if (d > maxSelfDrift) maxSelfDrift = d;
+    for (const s of sample.snaps) {
+      if (!s) continue;
+      const sp = s.serverPlayers[s.selfId];
+      if (!sp) continue;
+      const d = Math.hypot(s.clientPos.x - sp.x, s.clientPos.z - sp.z);
+      if (d > maxDrift) maxDrift = d;
+    }
   }
-  console.log(`MAX P1 client↔server drift across run: ${maxSelfDrift.toFixed(2)}u`);
+  console.log(`MAX client↔server player drift across ${N} browser(s): ${maxDrift.toFixed(2)}u`);
 } finally {
-  await browser.close();
+  try { await browser?.close(); } catch {}
+  await safeLeave(hostRoom);
 }
