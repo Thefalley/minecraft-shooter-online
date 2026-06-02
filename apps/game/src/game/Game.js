@@ -32,7 +32,10 @@ export class Game {
         enabled: new URLSearchParams(window.location.search).get('debug') === '1',
         ring: [],
         push(category, payload) {
-          if (this.ring.length >= 500) this.ring.shift();
+          // 2000-entry ring (~100 s of 20 Hz network noise) — large enough
+          // that diagnostic queries don't lose a kill event between
+          // server-broadcast and the test's evaluate roundtrip.
+          if (this.ring.length >= 2000) this.ring.shift();
           this.ring.push({ t: Date.now(), category, payload });
           if (this.enabled) console.debug(`[vox:${category}]`, payload);
         },

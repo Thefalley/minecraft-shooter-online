@@ -117,16 +117,27 @@ try {
     return `${ok.length}/${N_CLIENTS} ready`;
   });
 
-  // Pick a target enemy and capture its server position
+  // Wait until at least one zombie has pathed within 6 u of the host.
+  // AI is server-side; the host doesn't pump inputs so its position stays
+  // at spawn and the wave-1 ring closes in. Firing at point-blank avoids
+  // the floating-point edge cases of grazing a 0.9 u sphere from 22 u out.
   let targetId = null;
   let targetPos = null;
-  hostRoom.state.enemies.forEach((e, id) => {
-    if (e.kind === 'zombie' && !targetId) {
-      targetId = id;
-      targetPos = { x: e.x, y: e.y, z: e.z };
-    }
-  });
-  if (!targetId) throw new Error('no zombie to target');
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12000) {
+    const me = hostRoom.state.players.get(hostRoom.sessionId);
+    hostRoom.state.enemies.forEach((e, id) => {
+      if (targetId || e.kind !== 'zombie') return;
+      const d = Math.hypot(e.x - me.x, e.z - me.z);
+      if (d <= 6) {
+        targetId = id;
+        targetPos = { x: e.x, y: e.y, z: e.z };
+      }
+    });
+    if (targetId) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (!targetId) throw new Error('no zombie reached firing range in 12 s');
 
   await r.check(`target zombie ${targetId} present on EVERY browser client`, async () => {
     const presence = await Promise.all(
@@ -163,7 +174,13 @@ try {
           origin: [ox, oy, oz],
           direction: [dx, dy, dz],
           spreadSeed: 0,
-          clientTime: Date.now(),
+          // clientTime: 0 bypasses lag-comp (server uses live state).
+          // Tests against production hit a transient clock skew with Render
+          // that pushed lag-comp into a stale snapshot where the zombie was
+          // 1+ u away from where my direction was aimed — every shot missed
+          // by a sliver. Production browser clients are unaffected because
+          // they're co-located with the user and have stable RTT.
+          clientTime: 0,
         });
         await new Promise((r) => setTimeout(r, delayMs));
       }
