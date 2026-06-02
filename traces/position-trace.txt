@@ -1,0 +1,26 @@
+# multi-player position trace — 2026-06-02T11:02:45.136Z
+# server=wss://minecraft-shooter-online.onrender.com game=https://voxel-dragons-game.vercel.app clients=2 secs=15 room=V723P
+# columns: t_ms src   pid/eid             clientX clientY clientZ  serverX serverY serverZ  drift  note
+# phase 1 idle done @ 1514ms
+# phase 2 forward-slow done @ 4135ms
+     0 P1    P1/zSeTkLRoO          1.23    8.00   18.95     1.56    1.00   19.56   0.70  yaw=0.00 pl=Y
+     0 P2    P2/vIOb_jHQg          0.50    8.00   19.53     0.50    1.00   20.00   0.47  yaw=0.00 pl=n
+     0 E     zombie:e17            1.00    8.02   16.27     1.00    1.00   16.27   0.00
+     0 E     zombie:e18            3.72    8.02   19.42     3.72    1.00   19.42   0.00
+     0 E     zombie:e19            1.68    8.02   16.46     1.59    1.00   16.61   0.17
+     0 E     skeleton:e20        -10.74    9.02    8.75   -10.74    1.00    8.75   0.00
+  4836 P1    P1/zSeTkLRoO          1.31    8.00   18.57     1.56    1.00   19.56   1.02  yaw=0.00 pl=Y
+  4836 P2    P2/vIOb_jHQg          0.50    8.00   19.53     0.50    1.00   20.00   0.47  yaw=0.00 pl=n
+  4836 E     zombie:e17            1.00    8.02   16.27     1.00    1.00   16.27   0.00
+  4836 E     zombie:e18            3.72    8.02   19.42     3.72    1.00   19.42   0.00
+  4836 E     zombie:e19            1.68    8.02   16.46     1.59    1.00   16.61   0.17
+  4836 E     skeleton:e20        -10.74    9.02    8.75   -10.74    1.00    8.75   0.00
+# phase 3 sprint done @ 9981ms
+# phase 4 strafe done @ 16324ms
+  9004 P1    P1/zSeTkLRoO          1.56    8.00   -2.28     1.56    1.00   -3.12   0.84  yaw=0.00 pl=Y
+  9004 P2    P2/vIOb_jHQg          0.50    8.00   19.53     0.50    1.00   20.00   0.47  yaw=0.00 pl=n
+  9004 E     zombie:e17            1.00    8.02   16.27     1.00    1.00   16.27   0.00
+  9004 E     zombie:e18            3.72    8.02   19.42     2.67    1.00   18.64   1.31
+  9004 E     zombie:e19            1.68    8.02   16.46     1.59    1.00   16.61   0.17
+  9004 E     skeleton:e20        -10.74    9.02    8.75   -10.74    1.00    8.75   0.00
+# phase 5 back done @ 22568ms

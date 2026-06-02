@@ -143,38 +143,38 @@ try {
     return `${presence.length}/${N_CLIENTS}`;
   });
 
-  // Kill the zombie via the host (we use the raw host's vp:weapon:fire so the
-  // shot is server-validated with lag compensation). Fire several shots in a
-  // burst to overcome the zombie's HP regardless of weapon damage.
-  const KILL_TIME_T0 = Date.now();
-  for (let i = 0; i < 25; i += 1) {
-    hostRoom.send('vp:weapon:fire', {
-      seq: i + 1,
-      slotIndex: 0,
-      origin: [targetPos.x, targetPos.y + 1.6, targetPos.z + 0.3],
-      direction: [0, 0, -1],
-      spreadSeed: 0,
-      clientTime: Date.now(),
-    });
-    await new Promise((r) => setTimeout(r, 60));
-  }
-  // Some time for despawn to propagate to every client.
+  // Kill the zombie via the host. Server cheat-guards reject shots whose
+  // origin is more than 9 u from the shooter's authoritative position, so
+  // we must fire FROM the host's player position TOWARD the zombie, not
+  // from the zombie's own position.
+  const fireAtTarget = (seqStart, count, delayMs) => {
+    return (async () => {
+      for (let i = 0; i < count; i += 1) {
+        const me = hostRoom.state.players.get(hostRoom.sessionId);
+        const tgt = hostRoom.state.enemies.get(targetId);
+        if (!me || !tgt) return; // already dead
+        const ox = me.x, oy = me.y + 1.6, oz = me.z;
+        let dx = tgt.x - ox, dy = tgt.y + 1.0 - oy, dz = tgt.z - oz;
+        const len = Math.hypot(dx, dy, dz) || 1;
+        dx /= len; dy /= len; dz /= len;
+        hostRoom.send('vp:weapon:fire', {
+          seq: seqStart + i,
+          slotIndex: 0,
+          origin: [ox, oy, oz],
+          direction: [dx, dy, dz],
+          spreadSeed: 0,
+          clientTime: Date.now(),
+        });
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    })();
+  };
+  await fireAtTarget(1, 25, 60);
   await new Promise((res) => setTimeout(res, 1500));
 
   await r.check(`server removed ${targetId} from state.enemies`, async () => {
     if (hostRoom.state.enemies.has(targetId)) {
-      // Maybe damage didn't reach — fire one more burst.
-      for (let i = 0; i < 15; i += 1) {
-        hostRoom.send('vp:weapon:fire', {
-          seq: 100 + i,
-          slotIndex: 0,
-          origin: [targetPos.x, targetPos.y + 1.6, targetPos.z + 0.3],
-          direction: [0, 0, -1],
-          spreadSeed: 0,
-          clientTime: Date.now(),
-        });
-        await new Promise((r) => setTimeout(r, 80));
-      }
+      await fireAtTarget(100, 15, 80);
       await new Promise((res) => setTimeout(res, 1000));
       if (hostRoom.state.enemies.has(targetId)) {
         throw new Error(`${targetId} still alive on server after 40 shots`);
