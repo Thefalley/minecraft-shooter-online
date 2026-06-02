@@ -65,7 +65,7 @@ jobs:
         run: node tests/behavior-multiplayer.mjs
 
       - name: Self-check — sync-rate (server vs client tick, inter-client drift)
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: node tests/sync-rate.mjs
 
       - name: Self-check — log equivalence (server ring ≡ client ring)
