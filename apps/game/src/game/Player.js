@@ -234,6 +234,49 @@ export class Player {
     return this;
   }
 
+  /**
+   * Soft CSP reconciliation. Called from MultiplayerCoordinator when the
+   * server pushes a self-snapshot. Goal: keep client visual within ≤1 u of
+   * the server's stored position WITHOUT teleporting the player on every
+   * 50 ms sync. The server stores Y at PLAYER_SPAWN_Y (a flat 1.0) which is
+   * usually below terrain, so we never override Y from the snapshot — local
+   * gravity + collision owns vertical.
+   *
+   * Strategy (XZ only):
+   *   drift = hypot(client.x - snap.x, client.z - snap.z)
+   *   - drift ≤ 0.5 u     no-op (within input-pump tolerance)
+   *   - drift ≤ 4 u       lerp 25 % toward server (smooth catch-up)
+   *   - drift > 4 u       hard snap to server XZ (network glitch / lag spike)
+   *
+   * Without this, when the user moves fast or rotates while a frame stalls,
+   * the input pump's 1 s keep-alive cadence can leave the server 1-3 u
+   * behind the client's visual — every enemy then chases the SERVER ghost
+   * and the user sees zombies converge on a point 2 m behind them.
+   */
+  applyServerSnapshot(snap) {
+    if (!snap) return;
+    const x = Number.isFinite(snap.x) ? snap.x : null;
+    const z = Number.isFinite(snap.z) ? snap.z : null;
+    if (x == null || z == null) return;
+    const cp = this.cameraHolder.position;
+    const dx = cp.x - x;
+    const dz = cp.z - z;
+    const drift = Math.hypot(dx, dz);
+    if (drift <= 0.5) return;
+    if (drift > 4) {
+      cp.x = x;
+      cp.z = z;
+      return;
+    }
+    cp.x = cp.x + (x - cp.x) * 0.25;
+    cp.z = cp.z + (z - cp.z) * 0.25;
+  }
+
+  /** No-op used by PlayerPrediction to clear its rewind buffers on disable. */
+  clearPrediction() {
+    /* nothing to clear in the upstream player */
+  }
+
   look(yawDelta, pitchDelta) {
     this.cameraHolder.rotation.y -= yawDelta * this.config.mouseSensitivity;
     this.pitchHolder.rotation.x -= pitchDelta * this.config.mouseSensitivity;
